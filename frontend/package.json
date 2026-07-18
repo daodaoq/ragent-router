@@ -1,0 +1,69 @@
+{
+  "name": "ragent-router",
+  "version": "0.1.0",
+  "description": "RAgent Router - AI Cost Optimization & Smart Routing for Claude Code",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "vite:dev": "vite",
+    "build": "vite build",
+    "pack": "vite build && electron-builder --dir",
+    "dist": "vite build && electron-builder"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.4.0",
+    "antd": "^5.21.0",
+    "i18next": "^26.3.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-i18next": "^17.0.8",
+    "recharts": "^2.12.7",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.8",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "electron": "^32.1.0",
+    "electron-builder": "^25.0.5",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.7",
+    "wait-on": "^8.0.0"
+  },
+  "build": {
+    "appId": "com.ragent.router",
+    "productName": "RAgent Router",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!__pycache__",
+          "!*.db"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "public/icon.png"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "public/icon.png"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "public/icon.png"
+    }
+  }
+}
