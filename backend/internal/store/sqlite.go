@@ -6,22 +6,40 @@ import (
 	"strings"
 	"time"
 
+	// modernc.org/sqlite 是纯 Go 实现的 SQLite 驱动，无需 CGO。
+	// 选择原因：零 C 依赖，跨平台编译无痛，适合本地嵌入式数据库场景。
 	_ "modernc.org/sqlite"
 )
 
-// LogStore persists proxy request logs to SQLite.
+// LogStore 是请求日志的 SQLite 持久化存储。
+//
+// # 为什么用 SQLite
+//
+//   - 本地 Dashboard 场景不需要独立的数据库服务
+//   - 纯 Go 驱动，无 CGO，交叉编译无痛
+//   - WAL 模式 + 单连接足够支撑 Dashboard 的读负载
+//   - 零运维成本——不需要额外安装 MySQL/PostgreSQL
+//
+// # 连接管理
+//
+// SQLite 是单写者模型，SetMaxOpenConns(1) 避免写冲突。
+// WAL 模式下读不阻塞写，Dashboard 查询不影响代理日志写入。
 type LogStore struct {
 	db *sql.DB
 }
 
-// NewLogStore opens (or creates) the SQLite database and initializes the schema.
+// NewLogStore 打开（或创建）SQLite 数据库并自动建表。
+//
+// 连接字符串参数说明：
+//   - _journal_mode=WAL：Write-Ahead Logging，读不阻塞写
+//   - _busy_timeout=5000：写入冲突时等待 5 秒而非立即返回 SQLITE_BUSY
 func NewLogStore(path string) (*LogStore, error) {
 	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	// Connection pool: SQLite is single-writer, so limit connections.
+	// SQLite 单写者——限制连接数避免 SQLITE_BUSY。
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -33,12 +51,16 @@ func NewLogStore(path string) (*LogStore, error) {
 	return &LogStore{db: db}, nil
 }
 
-// Close closes the database connection.
+// Close 关闭数据库连接。
 func (s *LogStore) Close() error {
 	return s.db.Close()
 }
 
-// Insert saves a request log record.
+// ────────────────────────────────────────────────────────────
+// 写入操作
+// ────────────────────────────────────────────────────────────
+
+// Insert 保存一条请求日志。
 func (s *LogStore) Insert(log *RequestLogRecord) error {
 	_, err := s.db.Exec(`
 		INSERT INTO request_logs
@@ -57,7 +79,17 @@ func (s *LogStore) Insert(log *RequestLogRecord) error {
 	return err
 }
 
-// DashboardOverview returns aggregate dashboard statistics.
+// ────────────────────────────────────────────────────────────
+// Dashboard 查询
+// ────────────────────────────────────────────────────────────
+
+// DashboardOverview 返回 Dashboard 首页的聚合统计数据。
+//
+// 计算逻辑：
+//   - todayCost：当日所有请求的费用总和
+//   - monthCost：本月所有请求的费用总和
+//   - totalRequests：历史总请求数
+//   - savedAmount：通过规则路由到低价模型而节省的费用（估算为月费的 25%）
 func (s *LogStore) DashboardOverview() (*DashboardOverview, error) {
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -65,38 +97,39 @@ func (s *LogStore) DashboardOverview() (*DashboardOverview, error) {
 
 	var overview DashboardOverview
 
-	// Today's cost.
+	// 今日费用
 	err := s.db.QueryRow(
 		"SELECT COALESCE(SUM(cost_usd), 0) FROM request_logs WHERE created_at >= ?",
 		todayStart,
 	).Scan(&overview.TodayCost)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("today cost: %w", err)
 	}
 
-	// Month's cost.
+	// 本月费用
 	err = s.db.QueryRow(
 		"SELECT COALESCE(SUM(cost_usd), 0) FROM request_logs WHERE created_at >= ?",
 		monthStart,
 	).Scan(&overview.MonthCost)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("month cost: %w", err)
 	}
 
-	// Total requests.
+	// 总请求数
 	err = s.db.QueryRow("SELECT COUNT(1) FROM request_logs").Scan(&overview.TotalRequests)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("total requests: %w", err)
 	}
 
-	// Estimated savings (placeholder: assume 20% savings from routing to cheaper models).
+	// 节省估算：假设路由到低价模型节省了约 25% 的费用。
+	// 注：这只是一个近似值，精确计算需要对比"全部用 Claude"和"路由后"的费用差。
 	overview.SavedAmount = overview.MonthCost * 0.25
 	overview.SavingRate = 25.0
 
 	return &overview, nil
 }
 
-// ModelDistribution returns request distribution by model.
+// ModelDistribution 返回各模型的请求分布（按请求次数降序）。
 func (s *LogStore) ModelDistribution() ([]ModelDistribution, error) {
 	rows, err := s.db.Query(`
 		SELECT model, COUNT(1) as cnt
@@ -105,7 +138,7 @@ func (s *LogStore) ModelDistribution() ([]ModelDistribution, error) {
 		ORDER BY cnt DESC
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("model distribution: %w", err)
 	}
 	defer rows.Close()
 
@@ -119,12 +152,13 @@ func (s *LogStore) ModelDistribution() ([]ModelDistribution, error) {
 	for rows.Next() {
 		var i item
 		if err := rows.Scan(&i.Model, &i.Count); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan model: %w", err)
 		}
 		items = append(items, i)
 		total += i.Count
 	}
 
+	// 计算百分比。
 	var result []ModelDistribution
 	for _, it := range items {
 		pct := float64(0)
@@ -134,13 +168,13 @@ func (s *LogStore) ModelDistribution() ([]ModelDistribution, error) {
 		result = append(result, ModelDistribution{
 			Model:      it.Model,
 			Count:      it.Count,
-			Percentage: float64(int(pct*10)) / 10,
+			Percentage: float64(int(pct*10)) / 10, // 保留 1 位小数
 		})
 	}
 	return result, nil
 }
 
-// RecentRoutes returns the most recent request logs.
+// RecentRoutes 返回最近 N 条请求日志（按时间降序）。
 func (s *LogStore) RecentRoutes(limit int) ([]RecentRoute, error) {
 	if limit <= 0 {
 		limit = 20
@@ -153,7 +187,7 @@ func (s *LogStore) RecentRoutes(limit int) ([]RecentRoute, error) {
 		LIMIT ?
 	`, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("recent routes: %w", err)
 	}
 	defer rows.Close()
 
@@ -163,8 +197,9 @@ func (s *LogStore) RecentRoutes(limit int) ([]RecentRoute, error) {
 		var createdAt time.Time
 		if err := rows.Scan(&r.ID, &r.Prompt, &r.Model, &r.Provider,
 			&r.RouteReason, &r.CostUSD, &r.LatencyMs, &createdAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan route: %w", err)
 		}
+		// 提示词截断到 200 字符用于展示。
 		if len(r.Prompt) > 200 {
 			r.Prompt = r.Prompt[:200]
 		}
@@ -174,7 +209,7 @@ func (s *LogStore) RecentRoutes(limit int) ([]RecentRoute, error) {
 	return result, nil
 }
 
-// CostTrend returns daily cost and request counts for the past N days.
+// CostTrend 返回过去 N 天的每日费用和请求数趋势。
 func (s *LogStore) CostTrend(days int) ([]CostTrendPoint, error) {
 	if days <= 0 {
 		days = 7
@@ -190,7 +225,7 @@ func (s *LogStore) CostTrend(days int) ([]CostTrendPoint, error) {
 		ORDER BY day ASC
 	`, since)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cost trend: %w", err)
 	}
 	defer rows.Close()
 
@@ -198,14 +233,17 @@ func (s *LogStore) CostTrend(days int) ([]CostTrendPoint, error) {
 	for rows.Next() {
 		var p CostTrendPoint
 		if err := rows.Scan(&p.Date, &p.Cost, &p.Requests); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan trend: %w", err)
 		}
 		result = append(result, p)
 	}
 	return result, nil
 }
 
-// ByModel returns detailed per-model statistics.
+// ByModel 返回各模型的详细统计（按请求次数降序）。
+//
+// 统计维度：供应商、请求数、输入/输出 Token、缓存 Token、
+// 费用、平均/最小/最大延迟。
 func (s *LogStore) ByModel() ([]map[string]interface{}, error) {
 	rows, err := s.db.Query(`
 		SELECT
@@ -224,7 +262,7 @@ func (s *LogStore) ByModel() ([]map[string]interface{}, error) {
 		ORDER BY requests DESC
 	`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("by model: %w", err)
 	}
 	defer rows.Close()
 
@@ -235,25 +273,37 @@ func (s *LogStore) ByModel() ([]map[string]interface{}, error) {
 		var cost, avgLat float64
 		if err := rows.Scan(&model, &provider, &requests, &inputTokens, &outputTokens,
 			&cacheTokens, &cost, &avgLat, &minLat, &maxLat); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan by model: %w", err)
 		}
 		result = append(result, map[string]interface{}{
-			"model":              model,
-			"provider":           provider,
-			"requests":           requests,
-			"input_tokens":       inputTokens,
-			"output_tokens":      outputTokens,
-			"cache_read_tokens":  cacheTokens,
-			"cost_usd":           float64(int(cost*10000)) / 10000,
-			"avg_latency_ms":     int(avgLat),
-			"min_latency_ms":     minLat,
-			"max_latency_ms":     maxLat,
+			"model":             model,
+			"provider":          provider,
+			"requests":          requests,
+			"input_tokens":      inputTokens,
+			"output_tokens":     outputTokens,
+			"cache_read_tokens": cacheTokens,
+			"cost_usd":          float64(int(cost*10000)) / 10000,
+			"avg_latency_ms":    int(avgLat),
+			"min_latency_ms":    minLat,
+			"max_latency_ms":    maxLat,
 		})
 	}
 	return result, nil
 }
 
-// migrate creates the database schema if it doesn't exist.
+// ────────────────────────────────────────────────────────────
+// 数据库迁移
+// ────────────────────────────────────────────────────────────
+
+// migrate 创建数据库表结构（幂等，仅 CREATE TABLE IF NOT EXISTS）。
+//
+// 索引设计：
+//   - created_at：Dashboard 时间范围查询的核心索引
+//   - provider：按供应商过滤和分析
+//   - model：按模型统计分布和延迟
+//
+// 注意：索引会降低写入速度，但本项目写入模式是单条 INSERT
+// （非批量），影响可忽略。
 func migrate(db *sql.DB) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS request_logs (
@@ -284,7 +334,8 @@ func migrate(db *sql.DB) error {
 	return err
 }
 
-// CompactPrompt truncates a prompt for display.
+// CompactPrompt 截断提示词用于展示。
+// 保留前 maxLen 个字符，超出部分用 "..." 替代。
 func CompactPrompt(prompt string, maxLen int) string {
 	if len(prompt) <= maxLen {
 		return prompt

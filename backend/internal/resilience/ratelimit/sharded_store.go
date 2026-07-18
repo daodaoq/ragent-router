@@ -6,15 +6,22 @@ import (
 	"time"
 )
 
-// FNV-64a constants (Fowler–Noll–Vo hash, 64-bit variant).
+// ────────────────────────────────────────────────────────────
+// FNV-64a 哈希函数
+// ────────────────────────────────────────────────────────────
+
+// FNV-64a 常量（Fowler–Noll–Vo 哈希，64 位变体）。
+// 选择理由：非加密哈希中速度最快的一档，分布均匀性优秀，
+// 适合分片存储的 key 路由场景。
 const (
 	fnvOffset64 uint64 = 14695981039346656037
 	fnvPrime64  uint64 = 1099511628211
 )
 
-// HashFNV64a computes a FNV-64a hash of a string. This hash function
-// is non-cryptographic—chosen for speed and uniform distribution
-// rather than collision resistance.
+// HashFNV64a 计算字符串的 FNV-64a 哈希值。
+// 非加密哈希——选它是为了速度和分布均匀性，而非碰撞抵抗。
+// 在分片存储中，碰撞只会导致两个不同 key 路由到同一分片，
+// 不产生正确性问题，仅略微增加该分片的负载。
 func HashFNV64a(s string) uint64 {
 	h := fnvOffset64
 	for i := 0; i < len(s); i++ {
@@ -24,30 +31,48 @@ func HashFNV64a(s string) uint64 {
 	return h
 }
 
-// Store is the persistence abstraction for rate limiter state.
-// Implementations include in-memory (ShardedStore) and Redis (RedisStore).
+// ────────────────────────────────────────────────────────────
+// Store 接口
+// ────────────────────────────────────────────────────────────
+
+// Store 是限流器状态的持久化抽象。
+// 当前有两种实现：
+//   - ShardedStore：内存存储，分片锁，适合单实例部署
+//   - RedisStore：Redis 存储，分布式一致性，适合多实例部署（待实现）
+//
+// 接口方法的语义：
+//   - Load：如果 key 存在则返回已有值；否则调用 builder 创建新值、
+//     存储并返回。必须并发安全且保证 builder 在并发 Load 同一 key 时
+//     尽量少被调用（理想情况仅调用 1 次）。
+//   - Store：直接覆盖 key 的值，用于外部更新（如修改限流配额）。
 type Store interface {
-	// Load returns the value for key if present, otherwise calls builder
-	// to create a new value, stores it, and returns it.
 	Load(key string, builder func() interface{}) interface{}
-	// Store saves a value for the given key.
 	Store(key string, value interface{}) error
 }
 
-// ShardCount is the number of shards in a ShardedStore. 2048 is chosen
-// empirically: enough to virtually eliminate lock contention at typical
-// concurrency levels, without excessive memory overhead (~200 KB total).
+// ────────────────────────────────────────────────────────────
+// 分片存储
+// ────────────────────────────────────────────────────────────
+
+// ShardCount 是分片数。
+//
+// 为什么是 2048？
+//   - 足够大：在 32 核高并发下，期望冲突数 = goroutines / shards ≈ 0.015/shard，
+//     锁竞争基本消除。
+//   - 不太大：每个 Shard 包含 2 个 map + 1 个 RWMutex ≈ 100 bytes，
+//     2048 个 ≈ 200KB，内存开销可忽略。
+//   - 二次幂：对取模运算友好（编译器可能优化为位运算）。
 const ShardCount = 2048
 
-// Shard is a single partition of the sharded store. Each shard has its
-// own mutex, so contention is reduced to ≈ 1/ShardCount.
+// Shard 是分片存储的一个分区。每个分片持有独立的 sync.RWMutex，
+// 因此不同分片的操作可以完全并行。
 type Shard struct {
 	mu         sync.RWMutex
-	data       map[string]interface{}
-	lastAccess map[string]time.Time
+	data       map[string]interface{} // key → 限流器实例
+	lastAccess map[string]time.Time   // key → 最后访问时间（用于 TTL 驱逐）
 }
 
-// newShard creates an empty shard.
+// newShard 创建空分片。
 func newShard() *Shard {
 	return &Shard{
 		data:       make(map[string]interface{}),
@@ -55,26 +80,40 @@ func newShard() *Shard {
 	}
 }
 
-// ShardedStore is a high-concurrency key-value store that partitions data
-// across ShardCount shards using FNV-64a hashing. Each shard is protected
-// by its own sync.RWMutex, dramatically reducing lock contention compared
-// to a single global mutex.
+// ShardedStore 是高并发 KV 存储的核心实现。
 //
-// Load uses double-checked locking:
-//  1. RLock → check → RUnlock (optimistic, no contention)
-//  2. Lock → double-check → create → Unlock (pessimistic, only on miss)
+// # 设计
 //
-// This pattern ensures that the expensive write-lock path is only taken
-// when the key genuinely does not exist, while the common case (key
-// exists) only pays for a read lock.
+// 数据通过 FNV-64a 哈希分散到 ShardCount 个分片。
+// 每个分片有独立的 sync.RWMutex——不同分片的操作无锁竞争。
+//
+// # Double-Checked Locking
+//
+// Load 方法使用双重检查锁定模式：
+//
+//	1. RLock  → 检查 key 是否存在 → RUnlock   （乐观路径，无竞争）
+//	2. Lock   → 二次检查          → 创建/存储 → Unlock（悲观路径，仅缓存未命中时）
+//
+// 第一次检查（读锁）是乐观的：大多数 Load 调用 key 已存在，
+// 只需读锁即可返回。第二次检查（写锁内）是必要的：
+// 在我们释放读锁到获取写锁之间，另一个 goroutine 可能已经创建了该 key。
+// 没有二次检查会导致两个 goroutine 各创建一个值，先创建的那个会泄漏。
+//
+// # TTL 驱逐
+//
+// 后台 goroutine 周期性扫描所有分片，删除超过 TTL 未访问的条目。
+// 清理时持写锁，但仅在收集过期 key 并删除期间持有——sleep 期间释放锁。
 type ShardedStore struct {
-	shards  []*Shard
-	hasher  func(string) uint64
-	cancel  context.CancelFunc
+	shards []*Shard
+	hasher func(string) uint64
+	cancel context.CancelFunc
 }
 
-// NewShardedStore creates a ShardedStore with background TTL eviction.
-// ttl specifies how long entries live without access.
+// NewShardedStore 创建分片存储并启动后台 TTL 驱逐。
+//
+// 参数：
+//   - ctx：用于控制后台驱逐 goroutine 的生命周期
+//   - ttl：条目无访问后的存活时间
 func NewShardedStore(ctx context.Context, ttl time.Duration) *ShardedStore {
 	ctx, cancel := context.WithCancel(ctx)
 	shards := make([]*Shard, ShardCount)
@@ -92,11 +131,16 @@ func NewShardedStore(ctx context.Context, ttl time.Duration) *ShardedStore {
 	return s
 }
 
-// Load retrieves a value by key, creating it via builder on cache miss.
+// Load 获取 key 对应的值，若不存在则通过 builder 创建。
+//
+// 并发安全：多个 goroutine 同时 Load 同一 key，builder 可能被调用
+// 1 次或极少数次（取决于竞态窗口），但绝不会超过并发 goroutine 数。
+// 返回值唯一——所有调用者拿到同一个对象。
 func (s *ShardedStore) Load(key string, builder func() interface{}) interface{} {
 	sh := s.shards[s.shard(key)]
 
-	// Optimistic read — most calls return here.
+	// ── 阶段 1：乐观读 ──
+	// 大多数请求在这里返回，成本仅是一次 RLock + 一次 map 查询。
 	sh.mu.RLock()
 	v, ok := sh.data[key]
 	sh.mu.RUnlock()
@@ -104,17 +148,21 @@ func (s *ShardedStore) Load(key string, builder func() interface{}) interface{} 
 		return v
 	}
 
-	// Key missing — take write lock and double-check.
+	// ── 阶段 2：悲观写 ──
+	// 在获取写锁之前先调用 builder。builder 可能很重（涉及内存分配），
+	// 放在锁外执行可以减少临界区的长度。如果另一个 goroutine 抢先创建了
+	// key，这个 newVal 会被丢弃——代价是一次多余的内存分配，但换来了
+	// 更短的锁持有时间。
 	newVal := builder()
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	// Double-check: another goroutine may have created the key between
-	// our RUnlock and Lock. Without this check, we'd create a duplicate
-	// and the original holder would leak.
+	// ── 阶段 3：二次检查 ──
+	// 防止 TOCTOU 竞争：RUnlock 到 Lock 之间，另一个 goroutine 可能
+	// 已经创建了 key。不加这行 → 两个值同时存在 → 内存泄漏 + 数据不一致。
 	v, ok = sh.data[key]
 	if ok {
-		return v
+		return v // 另一个 goroutine 抢先了，返回它的值
 	}
 
 	sh.data[key] = newVal
@@ -122,7 +170,7 @@ func (s *ShardedStore) Load(key string, builder func() interface{}) interface{} 
 	return newVal
 }
 
-// Store saves a value for the given key.
+// Store 保存一个值到指定 key（覆盖已有值）。
 func (s *ShardedStore) Store(key string, value interface{}) error {
 	sh := s.shards[s.shard(key)]
 	sh.mu.Lock()
@@ -132,19 +180,29 @@ func (s *ShardedStore) Store(key string, value interface{}) error {
 	return nil
 }
 
-// shard computes which shard a key maps to.
+// shard 计算 key 所属的分片索引。
 func (s *ShardedStore) shard(key string) uint64 {
 	return s.hasher(key) % ShardCount
 }
 
-// Close stops the background eviction goroutine.
+// Close 停止后台 TTL 驱逐 goroutine。
 func (s *ShardedStore) Close() error {
 	s.cancel()
 	return nil
 }
 
-// evictLoop periodically removes expired entries. The lock is held only
-// while collecting keys and deleting—not during the sleep interval.
+// ────────────────────────────────────────────────────────────
+// TTL 驱逐
+// ────────────────────────────────────────────────────────────
+
+// evictLoop 周期性扫描所有分片，删除超过 TTL 未访问的条目。
+//
+// 驱逐频率 = TTL / 2。用一半 TTL 作为间隔是为了避免：
+//   - TTL 到期后条目仍残留在内存中太久（驱逐间隔太大）
+//   - 过于频繁的扫描浪费 CPU（驱逐间隔太小）
+//
+// 锁策略：每个分片独立处理——持锁 → 收集过期 key → 删除 → 释放。
+// 不会在持锁状态下 sleep，因此不会阻塞读写请求超过 O(过期条目数)。
 func (s *ShardedStore) evictLoop(ctx context.Context, ttl time.Duration) {
 	ticker := time.NewTicker(ttl / 2)
 	defer ticker.Stop()
@@ -168,7 +226,11 @@ func (s *ShardedStore) evictLoop(ctx context.Context, ttl time.Duration) {
 	}
 }
 
-// Stats returns aggregate statistics across all shards.
+// ────────────────────────────────────────────────────────────
+// 统计
+// ────────────────────────────────────────────────────────────
+
+// Stats 返回所有分片的聚合统计（只读快照）。
 func (s *ShardedStore) Stats() StoreStats {
 	var total int
 	for _, sh := range s.shards {
@@ -179,8 +241,8 @@ func (s *ShardedStore) Stats() StoreStats {
 	return StoreStats{Entries: total, Shards: ShardCount}
 }
 
-// StoreStats holds aggregate metrics for a ShardedStore.
+// StoreStats 是分片存储的聚合指标。
 type StoreStats struct {
-	Entries int
-	Shards  int
+	Entries int // 当前存储的条目总数
+	Shards  int // 分片数量
 }

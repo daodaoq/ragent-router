@@ -1,6 +1,27 @@
-// Package routing provides request-to-provider routing logic.
-// The rule engine matches user prompts against configured patterns
-// and selects the appropriate AI provider.
+// Package routing 提供基于规则的关键词匹配路由引擎。
+//
+// # 路由流程
+//
+//	用户提示词 + 请求模型名 → RuleEngine.Match() → 目标供应商
+//
+// 规则按优先级从高到低依次评估，首次匹配成功即返回。
+// 如果没有任何规则命中，回退到默认供应商。
+//
+// # 规则设计
+//
+// 每条规则包含：
+//   - Keywords：触发关键词（大小写不敏感，对提示词做子串匹配）
+//   - Priority：优先级（数值越大越先评估）
+//   - Provider：命中的目标供应商名称
+//   - MinTokens：最小 Token 阈值（可选，短提示词不触发）
+//
+// # 扩展方向
+//
+// 当前实现是基于子串匹配的简单规则引擎。后续可以扩展为：
+//   - Embedding 相似度匹配：将提示词向量化，与每个 intent 的
+//     示例向量做余弦相似度比较
+//   - LLM 分类器：用小模型快速分类提示词的 intent → 路由
+//   - 复杂度评估：根据 Token 数、嵌套深度、技术术语密度评估问题复杂度
 package routing
 
 import (
@@ -10,37 +31,59 @@ import (
 	"github.com/ragent/router/internal/proxy"
 )
 
-// Rule defines a routing rule that matches requests to providers.
+// ────────────────────────────────────────────────────────────
+// 规则定义
+// ────────────────────────────────────────────────────────────
+
+// Rule 定义了从用户提示词到供应商的一条路由规则。
 type Rule struct {
-	// Name is a human-readable label for this rule.
+	// Name 是规则的可读名称，用于日志和调试。
 	Name string `json:"name"`
 
-	// Keywords that trigger this rule (case-insensitive match against prompt).
+	// Keywords 是触发此规则的关键词列表。
+	// 匹配时对提示词做大小写不敏感的子串匹配。
+	// 只要提示词包含任意一个关键词，规则即命中。
 	Keywords []string `json:"keywords"`
 
-	// Provider is the name of the target provider.
+	// Provider 是命中此规则后的目标供应商名称。
 	Provider string `json:"provider"`
 
-	// Priority determines rule precedence (higher = evaluated first).
+	// Priority 是规则优先级，数值越大越先评估。
+	// 两条规则同时命中时，Priority 高的胜出。
 	Priority int `json:"priority"`
 
-	// MinTokens triggers this rule only if the prompt exceeds this length
-	// (approximate token count = characters / 4). 0 = no minimum.
+	// MinTokens 是触发此规则的最小 Token 数阈值（估算值≈字符数/4）。
+	// 设为 0 表示不限制。
+	// 用途：简单问题即使包含关键词也不走复杂模型。
 	MinTokens int `json:"min_tokens,omitempty"`
 }
 
-// RuleEngine matches requests to providers using keyword-based rules.
-// Rules are evaluated in priority order; the first match wins.
-// If no rule matches, the default provider is returned.
+// ────────────────────────────────────────────────────────────
+// 规则引擎
+// ────────────────────────────────────────────────────────────
+
+// RuleEngine 是基于优先级的关键词路由引擎。
+//
+// 规则集在创建时按优先级降序排列。
+// Match 方法在规则列表中线性扫描，首次匹配即返回。
+//
+// 复杂度：O(N) 其中 N 是规则数。当前默认规则数为 6，
+// 线性扫描足够。如果规则数增长到数百条，可考虑使用
+// Aho-Corasick 或 trie 优化关键词匹配。
 type RuleEngine struct {
-	rules           []Rule
-	providers       map[string]*proxy.ProviderConfig
-	defaultProvider string
+	rules           []Rule                          // 按优先级降序排列的规则列表
+	providers       map[string]*proxy.ProviderConfig // 供应商注册表
+	defaultProvider string                          // 无规则命中时的回退供应商
 }
 
-// NewRuleEngine creates a rule engine with the given rules and provider registry.
+// NewRuleEngine 创建规则引擎。
+//
+// 参数：
+//   - rules：路由规则集（会被复制，不会被修改）
+//   - providers：供应商名称 → 配置的映射
+//   - defaultProvider：无规则命中时的默认供应商名称
 func NewRuleEngine(rules []Rule, providers map[string]*proxy.ProviderConfig, defaultProvider string) *RuleEngine {
-	// Sort rules by priority descending.
+	// 复制并排序（不修改调用方的切片）。
 	sorted := make([]Rule, len(rules))
 	copy(sorted, rules)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -54,12 +97,20 @@ func NewRuleEngine(rules []Rule, providers map[string]*proxy.ProviderConfig, def
 	}
 }
 
-// Match selects a provider based on the user's prompt and requested model.
-// Returns nil if no provider could be determined.
+// Match 根据用户提示词和请求模型名选择目标供应商。
+//
+// 匹配逻辑（按顺序，首个成功即返回）：
+//  1. 按优先级从高到低匹配规则
+//  2. 如果请求了特定模型（model != "" 且 != "auto"），
+//     寻找名称中包含该模型名的供应商
+//  3. 回退到默认供应商
+//  4. 返回任意一个已启用的供应商
+//
+// 返回值 nil 表示没有任何可用供应商。
 func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 	promptLower := strings.ToLower(prompt)
 
-	// Try each rule in priority order.
+	// 阶段 1：尝试规则匹配。
 	for _, rule := range e.rules {
 		if !e.ruleMatches(rule, promptLower) {
 			continue
@@ -69,7 +120,7 @@ func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 		}
 	}
 
-	// If a specific model was requested, try to find a matching provider.
+	// 阶段 2：尝试按请求的模型名匹配。
 	if model != "" && model != "auto" {
 		for _, prov := range e.providers {
 			if prov.Enabled && strings.Contains(strings.ToLower(prov.Name), strings.ToLower(model)) {
@@ -78,12 +129,12 @@ func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 		}
 	}
 
-	// Fall back to the default provider.
+	// 阶段 3：回退到默认供应商。
 	if prov, ok := e.providers[e.defaultProvider]; ok && prov.Enabled {
 		return prov
 	}
 
-	// Return any enabled provider.
+	// 阶段 4：返回任意启用的供应商。
 	for _, prov := range e.providers {
 		if prov.Enabled {
 			return prov
@@ -92,17 +143,19 @@ func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 	return nil
 }
 
-// ruleMatches checks if a rule matches the given prompt.
+// ruleMatches 检查一条规则是否匹配给定提示词。
 func (e *RuleEngine) ruleMatches(rule Rule, promptLower string) bool {
-	// Check min tokens constraint.
+	// 检查 Token 阈值约束。
 	if rule.MinTokens > 0 {
+		// 估算：平均 1 Token ≈ 4 个英文字符（中文 ≈ 1.5 个字符/Token，
+		// 但为了简单使用统一估算）。
 		estimatedTokens := len(promptLower) / 4
 		if estimatedTokens < rule.MinTokens {
 			return false
 		}
 	}
 
-	// Check keywords.
+	// 检查关键词（子串匹配，大小写不敏感）。
 	if len(rule.Keywords) == 0 {
 		return false
 	}
@@ -114,7 +167,11 @@ func (e *RuleEngine) ruleMatches(rule Rule, promptLower string) bool {
 	return false
 }
 
-// AddRule adds a rule dynamically and re-sorts by priority.
+// ────────────────────────────────────────────────────────────
+// 运行时规则管理
+// ────────────────────────────────────────────────────────────
+
+// AddRule 动态添加规则并自动按优先级重排。
 func (e *RuleEngine) AddRule(rule Rule) {
 	e.rules = append(e.rules, rule)
 	sort.Slice(e.rules, func(i, j int) bool {
@@ -122,7 +179,7 @@ func (e *RuleEngine) AddRule(rule Rule) {
 	})
 }
 
-// RemoveRule removes a rule by name.
+// RemoveRule 按名称删除规则。
 func (e *RuleEngine) RemoveRule(name string) {
 	for i, r := range e.rules {
 		if r.Name == name {
@@ -132,49 +189,59 @@ func (e *RuleEngine) RemoveRule(name string) {
 	}
 }
 
-// Rules returns a copy of all rules.
+// Rules 返回所有规则（按优先级降序）。
 func (e *RuleEngine) Rules() []Rule {
 	result := make([]Rule, len(e.rules))
 	copy(result, e.rules)
 	return result
 }
 
-// DefaultRules returns a sensible set of routing rules for AI coding assistants.
+// ────────────────────────────────────────────────────────────
+// 默认规则集
+// ────────────────────────────────────────────────────────────
+
+// DefaultRules 返回一套面向 AI 编码助手的默认规则。
+//
+// 设计原则：
+//   - 复杂任务（架构、调试、代码生成）→ Claude（质量优先）
+//   - 简单任务（问答、文档）→ DeepSeek（成本优先）
+//   - 未命中 → DeepSeek（成本最敏感）
 func DefaultRules() []Rule {
 	return []Rule{
 		{
-			Name:     "Architecture & Design",
+			Name:     "架构与设计",
 			Keywords: []string{"architecture", "design", "refactor", "架构", "设计", "重构", "system design", "distributed", "microservice"},
 			Provider: "claude",
 			Priority: 100,
 		},
 		{
-			Name:     "Bug Fix & Debugging",
+			Name:     "Bug 修复与调试",
 			Keywords: []string{"bug", "fix", "debug", "error", "修复", "调试", "issue", "crash", "exception"},
 			Provider: "claude",
 			Priority: 90,
 		},
 		{
-			Name:     "Code Generation",
-			Keywords: []string{"generate", "create", "implement", "生成", "创建", "implement", "write code", "build a"},
+			Name:     "代码生成",
+			Keywords: []string{"generate", "create", "implement", "生成", "创建", "write code", "build a"},
 			Provider: "claude",
 			Priority: 80,
 		},
 		{
-			Name:     "Complex Analysis",
+			Name:     "复杂分析",
 			Keywords: []string{"analyze", "analysis", "review", "explain", "分析", "审查"},
 			Provider: "claude",
 			Priority: 70,
+			// 仅长提示词触发，短问题走 DeepSeek。
 			MinTokens: 300,
 		},
 		{
-			Name:     "Simple Questions",
+			Name:     "简单问答",
 			Keywords: []string{"explain", "what is", "how to", "解释", "什么是", "how does", "why is"},
 			Provider: "deepseek",
 			Priority: 50,
 		},
 		{
-			Name:     "Documentation",
+			Name:     "文档",
 			Keywords: []string{"document", "readme", "doc", "comment", "文档", "README", "documentation"},
 			Provider: "deepseek",
 			Priority: 40,

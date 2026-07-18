@@ -1,8 +1,20 @@
-// RAgent Router — AI API Gateway with Resilience Engine
+// RAgent Router —— AI API 智能网关与容错引擎
 //
-// A transparent proxy between Claude Code and multiple AI providers,
-// featuring circuit breaking, rate limiting, retry with jitter,
-// token tracking, intelligent routing, and cost analytics.
+// 在 Claude Code 与多个大模型供应商之间构建的透明代理层，
+// 提供熔断降级、限流控制、Jitter 重试、Token 计量、智能路由与成本分析能力。
+//
+// 启动方式：
+//
+//	# 通过环境变量配置供应商
+//	DEEPSEEK_API_KEY=sk-xxx go run ./cmd/server
+//
+//	# 通过 JSON 批量配置
+//	PROVIDERS='[{"id":"1","name":"DeepSeek","base_url":"https://api.deepseek.com","api_key":"sk-xxx","model":"deepseek-chat","enabled":true}]' go run ./cmd/server
+//
+//	# 构建可执行文件
+//	go build -o ragent-router ./cmd/server
+//
+// 服务默认监听 :15722，前端 Dashboard 连接同一端口。
 package main
 
 import (
@@ -25,43 +37,47 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 15722, "listen port")
-	dbPath := flag.String("db", "ragent_router.db", "SQLite database path")
+	// ── 命令行参数 ──
+	port := flag.Int("port", 15722, "监听端口")
+	dbPath := flag.String("db", "ragent_router.db", "SQLite 数据库路径")
 	flag.Parse()
 
-	// Initialize storage.
+	// ── 初始化存储层 ──
 	logStore, err := store.NewLogStore(*dbPath)
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		log.Fatalf("[启动] 数据库初始化失败: %v", err)
 	}
 	defer logStore.Close()
-	log.Printf("[INIT] Database ready: %s", *dbPath)
+	log.Printf("[启动] 数据库已就绪: %s", *dbPath)
 
-	// Configure providers.
-	// In production, these would come from environment variables or a config file.
+	// ── 加载供应商配置 ──
 	providers := loadProviders()
+	if len(providers) == 0 {
+		log.Println("[警告] 未配置任何供应商——请设置环境变量或 PROVIDERS JSON")
+		log.Println("[警告] 例如：DEEPSEEK_API_KEY=sk-xxx CLAUDE_API_KEY=sk-ant-xxx go run ./cmd/server")
+	}
 
-	// Build the provider registry for routing.
+	// 构建供应商注册表（供路由引擎使用）。
 	providerMap := make(map[string]*proxy.ProviderConfig)
 	for i := range providers {
 		providers[i].Enabled = true
 		providerMap[providers[i].Name] = &providers[i]
 	}
 
-	// Set up routing.
+	// ── 初始化路由引擎 ──
 	rules := routing.DefaultRules()
-	defaultProvider := "deepseek" // cheapest model as default
+	defaultProvider := "deepseek"
 	engine := routing.NewRuleEngine(rules, providerMap, defaultProvider)
 
-	// Create the proxy.
+	// ── 创建代理（核心韧性组件在此组装）──
 	p := proxy.NewProxy(proxy.Config{
 		Providers:             providers,
 		Matcher:               engine,
-		GlobalRateLimit:       100, // 100 req/s global limit
-		MaxConcurrentRequests: 50,
+		GlobalRateLimit:       100, // 全局 QPS 100
+		MaxConcurrentRequests: 50,  // 最多 50 个并发请求
 	})
 
-	// Wire up request logging to SQLite.
+	// ── 请求日志回调：代理请求完成后写入 SQLite ──
 	p.OnRequestLog = func(rl proxy.RequestLog) {
 		record := &store.RequestLogRecord{
 			ID:                 fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -80,17 +96,14 @@ func main() {
 			CreatedAt:          rl.Timestamp,
 		}
 		if err := logStore.Insert(record); err != nil {
-			log.Printf("[STORE] Failed to insert log: %v", err)
+			log.Printf("[存储] 写入日志失败: %v", err)
 		}
 	}
 
-	// Build HTTP server.
+	// ── 构建 HTTP 路由 ──
 	mux := http.NewServeMux()
 
-	// CORS middleware.
-	handler := corsMiddleware(mux)
-
-	// Health check.
+	// ── 健康检查 ──
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":  "ok",
@@ -99,24 +112,33 @@ func main() {
 		})
 	})
 
-	// ---- Proxy endpoint (Anthropic-compatible) ----
+	// ════════════════════════════════════════════════════════════
+	// 代理端点（Anthropic Messages API 兼容）
+	// ════════════════════════════════════════════════════════════
+
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
+			// GET 返回状态信息（方便调试）。
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"proxy":    "ragent-router",
 				"endpoint": "/v1/messages",
-				"method":   "POST (streaming SSE)",
+				"method":   "POST (SSE streaming)",
 				"status":   "ok",
 			})
 			return
 		}
+		// POST 请求进入全韧性保护的代理流程。
 		p.ServeHTTP(w, r)
 	})
 	mux.HandleFunc("/v1/messages/", func(w http.ResponseWriter, r *http.Request) {
 		p.ServeHTTP(w, r)
 	})
 
-	// ---- Dashboard API ----
+	// ════════════════════════════════════════════════════════════
+	// Dashboard API
+	// ════════════════════════════════════════════════════════════
+
+	// 获取 Dashboard 首页概览（日/月费用、总请求数、节省估算）。
 	mux.HandleFunc("/api/dashboard/overview", func(w http.ResponseWriter, r *http.Request) {
 		overview, err := logStore.DashboardOverview()
 		if err != nil {
@@ -126,6 +148,7 @@ func main() {
 		writeJSON(w, http.StatusOK, overview)
 	})
 
+	// 获取各模型的请求分布（饼图数据）。
 	mux.HandleFunc("/api/dashboard/model-distribution", func(w http.ResponseWriter, r *http.Request) {
 		items, err := logStore.ModelDistribution()
 		if err != nil {
@@ -135,6 +158,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": items})
 	})
 
+	// 获取最近 N 条请求日志（默认 20 条）。
 	mux.HandleFunc("/api/dashboard/recent-routes", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		if limit <= 0 {
@@ -148,6 +172,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": routes})
 	})
 
+	// 获取过去 N 天的费用趋势（默认 7 天）。
 	mux.HandleFunc("/api/dashboard/cost-trend", func(w http.ResponseWriter, r *http.Request) {
 		days, _ := strconv.Atoi(r.URL.Query().Get("days"))
 		if days <= 0 {
@@ -161,7 +186,11 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"points": points})
 	})
 
-	// ---- Monitor API ----
+	// ════════════════════════════════════════════════════════════
+	// 监控 API
+	// ════════════════════════════════════════════════════════════
+
+	// 获取聚合监控数据（总请求数、Token、费用、延迟、错误率）。
 	mux.HandleFunc("/api/monitor/overview", func(w http.ResponseWriter, r *http.Request) {
 		overview, err := logStore.DashboardOverview()
 		if err != nil {
@@ -170,16 +199,17 @@ func main() {
 		}
 		byModel, _ := logStore.ByModel()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"total_requests":     overview.TotalRequests,
-			"today_requests":     0,
-			"error_count":        0,
-			"total_tokens":       0,
-			"total_cost_usd":     overview.MonthCost,
-			"avg_latency_ms":     0,
-			"by_model":           byModel,
+			"total_requests": overview.TotalRequests,
+			"today_requests": 0,
+			"error_count":    0,
+			"total_tokens":   0,
+			"total_cost_usd": overview.MonthCost,
+			"avg_latency_ms": 0,
+			"by_model":       byModel,
 		})
 	})
 
+	// 获取最近的原始请求日志（可配置条数）。
 	mux.HandleFunc("/api/monitor/recent", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		if limit <= 0 {
@@ -193,6 +223,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": routes})
 	})
 
+	// 获取各模型的详细统计（延迟、费用、Token 明细）。
 	mux.HandleFunc("/api/monitor/by-model", func(w http.ResponseWriter, r *http.Request) {
 		byModel, err := logStore.ByModel()
 		if err != nil {
@@ -202,7 +233,11 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": byModel})
 	})
 
-	// ---- Proxy Management API ----
+	// ════════════════════════════════════════════════════════════
+	// 供应商管理 API
+	// ════════════════════════════════════════════════════════════
+
+	// 获取当前活跃的供应商信息。
 	mux.HandleFunc("/api/proxy/current", func(w http.ResponseWriter, r *http.Request) {
 		providers := p.ListProviders()
 		if len(providers) == 0 {
@@ -210,11 +245,10 @@ func main() {
 				"provider_id":   "",
 				"provider_name": "none",
 				"is_valid":      false,
-				"warning":       "No providers configured",
+				"warning":       "未配置任何供应商",
 			})
 			return
 		}
-		// Return the first enabled provider as "current".
 		for _, prov := range providers {
 			if prov.Enabled {
 				writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -230,30 +264,31 @@ func main() {
 		}
 	})
 
+	// 激活指定供应商。
 	mux.HandleFunc("/api/proxy/activate/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "需要 POST 请求"})
 			return
 		}
-		// Extract provider ID from URL: /api/proxy/activate/{id}
 		providerID := strings.TrimPrefix(r.URL.Path, "/api/proxy/activate/")
 		if providerID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider id required"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少供应商 ID"})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":       true,
 			"provider_name": providerID,
-			"message":       fmt.Sprintf("Activated provider: %s", providerID),
+			"message":       fmt.Sprintf("已切换到供应商: %s", providerID),
 		})
 	})
 
+	// 获取代理健康状态。
 	mux.HandleFunc("/api/proxy/health", func(w http.ResponseWriter, r *http.Request) {
 		providers := p.ListProviders()
 		warnings := []string{}
 		ready := len(providers) > 0
 		if !ready {
-			warnings = append(warnings, "No providers configured")
+			warnings = append(warnings, "未配置任何供应商")
 		}
 		writeJSON(w, http.StatusOK, store.ProxyHealth{
 			StateFileOK:         true,
@@ -263,26 +298,30 @@ func main() {
 		})
 	})
 
-	// ---- Provider List API ----
+	// 获取所有已注册的供应商列表。
 	mux.HandleFunc("/api/ccswitch/providers", func(w http.ResponseWriter, r *http.Request) {
 		providers := p.ListProviders()
 		items := make([]map[string]interface{}, 0, len(providers))
 		for _, prov := range providers {
 			items = append(items, map[string]interface{}{
-				"id":          prov.ID,
-				"name":        prov.Name,
-				"app_type":    "claude",
-				"category":    "custom",
-				"is_current":  true,
-				"icon_color":  "#6366f1",
-				"enabled":     prov.Enabled,
-				"endpoints":   []map[string]string{{"app_type": "claude", "url": prov.BaseURL}},
+				"id":         prov.ID,
+				"name":       prov.Name,
+				"app_type":   "claude",
+				"category":   "custom",
+				"is_current": true,
+				"icon_color": "#6366f1",
+				"enabled":    prov.Enabled,
+				"endpoints":  []map[string]string{{"app_type": "claude", "url": prov.BaseURL}},
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"items": items, "total": len(items)})
 	})
 
-	// ---- Circuit Breaker Stats API ----
+	// ════════════════════════════════════════════════════════════
+	// 韧性引擎状态 API
+	// ════════════════════════════════════════════════════════════
+
+	// 获取各供应商的熔断器状态（供调试和监控）。
 	mux.HandleFunc("/api/resilience/stats", func(w http.ResponseWriter, r *http.Request) {
 		providers := p.ListProviders()
 		stats := make(map[string]interface{})
@@ -300,41 +339,60 @@ func main() {
 		writeJSON(w, http.StatusOK, stats)
 	})
 
-	// Start server.
+	// ── 启动服务器 ──
 	addr := fmt.Sprintf(":%d", *port)
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      handler,
+		Handler:      corsMiddleware(mux),
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 300 * time.Second, // Long timeout for SSE streaming
+		WriteTimeout: 300 * time.Second, // SSE 流式传输需要长超时
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Graceful shutdown.
+	// 优雅关闭：收到 SIGINT/SIGTERM 后等待现有请求完成再退出。
 	go func() {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 		<-sigs
-		log.Println("[SHUTDOWN] Received signal, shutting down...")
+		log.Println("[关闭] 收到终止信号，正在优雅退出...")
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		server.Shutdown(ctx)
 	}()
 
-	log.Printf("[START] RAgent Router listening on http://localhost%s", addr)
-	log.Printf("[START] Providers: %d registered", len(providers))
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+	log.Printf("[启动] RAgent Router 监听 http://localhost%s", addr)
+	log.Printf("[启动] 已注册 %d 个供应商", len(providers))
+	for _, prov := range providers {
+		log.Printf("[启动]   - %s (%s)", prov.Name, prov.Model)
 	}
-	log.Println("[STOP] Server stopped")
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("[启动] 服务异常退出: %v", err)
+	}
+	log.Println("[关闭] 服务已停止")
 }
 
-// loadProviders reads provider configuration from environment variables.
-// Expected format:
+// ────────────────────────────────────────────────────────────
+// 供应商配置加载
+// ────────────────────────────────────────────────────────────
+
+// loadProviders 从环境变量加载供应商配置。
 //
-//	PROVIDERS='[{"id":"1","name":"DeepSeek","base_url":"https://api.deepseek.com","api_key":"sk-...","model":"deepseek-chat"}]'
+// 支持两种方式：
+//  1. 单独环境变量：DEEPSEEK_API_KEY, CLAUDE_API_KEY 等
+//  2. JSON 批量配置：PROVIDERS 环境变量包含 JSON 数组
+//
+// JSON 格式示例：
+//
+//	[{
+//	  "id": "1",
+//	  "name": "DeepSeek",
+//	  "base_url": "https://api.deepseek.com",
+//	  "api_key": "sk-xxx",
+//	  "model": "deepseek-chat",
+//	  "enabled": true
+//	}]
 func loadProviders() []proxy.ProviderConfig {
-	// Default demo providers (with placeholder keys).
+	// 默认供应商（需通过环境变量激活）。
 	defaults := []proxy.ProviderConfig{
 		{
 			ID:      "deepseek-default",
@@ -362,16 +420,16 @@ func loadProviders() []proxy.ProviderConfig {
 		},
 	}
 
-	// Check for JSON config in PROVIDERS env var.
+	// 尝试从 PROVIDERS 环境变量读取 JSON 配置（覆盖默认值）。
 	if providersJSON := os.Getenv("PROVIDERS"); providersJSON != "" {
 		var configured []proxy.ProviderConfig
 		if err := json.Unmarshal([]byte(providersJSON), &configured); err == nil && len(configured) > 0 {
 			return configured
 		}
-		log.Printf("[CONFIG] Invalid PROVIDERS JSON, using defaults")
+		log.Printf("[配置] PROVIDERS JSON 解析失败，使用环境变量默认值")
 	}
 
-	// Filter out providers without API keys.
+	// 过滤掉未配置密钥的供应商。
 	var result []proxy.ProviderConfig
 	for _, p := range defaults {
 		if p.Enabled {
@@ -388,7 +446,12 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// corsMiddleware adds CORS headers and handles preflight requests.
+// ────────────────────────────────────────────────────────────
+// 中间件
+// ────────────────────────────────────────────────────────────
+
+// corsMiddleware 添加跨域访问头并处理预检请求。
+// 允许前端 Dashboard（可能运行在不同端口）调用后端 API。
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -404,11 +467,11 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// writeJSON serializes data as a JSON response.
+// writeJSON 以 JSON 格式写回响应。
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("[HTTP] Failed to encode response: %v", err)
+		log.Printf("[HTTP] JSON 编码失败: %v", err)
 	}
 }
