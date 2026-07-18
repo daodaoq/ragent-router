@@ -1,45 +1,44 @@
 # RAgent Router
 
-**AI API Gateway with Resilience Engine — built in Go.**
+**Go 实现的 AI API 智能网关与容错引擎。**
 
-A transparent proxy layer between AI coding assistants (Claude Code, Cursor, etc.) and multiple LLM providers, featuring circuit breaking, rate limiting, retry with jitter, token tracking, intelligent routing, and cost analytics.
+在 Claude Code 与多个大模型供应商之间构建的透明代理层，提供熔断降级、限流控制、Jitter 重试、Token 计量、智能路由与成本分析能力。
 
-## Why This Exists
+## 项目动机
 
-Using Claude Code daily, I ran into three problems:
+日常使用 Claude Code 开发时遇到了三个痛点：
 
-1. **No fault tolerance** — when an upstream API returns 5xx or gets throttled, all requests fail. No retry, no fallback, no circuit breaking.
-2. **No cost visibility** — token consumption and API spend are completely opaque.
-3. **No intelligent routing** — simple "explain this" queries and complex architecture designs all hit the same expensive model.
+1. **零容错** — 上游 API 返回 5xx 或被限流时，所有请求直接失败。没有重试、没有降级、没有熔断。
+2. **成本不透明** — Token 消耗和 API 费用完全不可见。
+3. **路由不智能** — "Redis 是什么"这种一句话问题，和"设计一个分布式任务系统"这种复杂任务，调用的是同一个昂贵模型。
 
-RAgent Router sits between the AI tool and the providers, solving all three without changing the client workflow.
+RAgent Router 在 AI 工具和供应商之间加了一层中间件，在不改变客户端使用习惯的前提下解决这三个问题。
 
-## Architecture
+## 架构
 
 ```
-Claude Code / AI Client
+Claude Code / AI 客户端
         │
-        │  POST /v1/messages (Anthropic-compatible, SSE streaming)
+        │  POST /v1/messages (Anthropic 兼容, SSE 流式)
         │
    ┌────▼──────────────────────────────────────────┐
    │              RAgent Router (Go)                │
    │                                                │
    │  ┌──────────────────────────────────────────┐ │
-   │  │         Resilience Pipeline               │ │
+   │  │         韧性引擎（自研核心）               │ │
    │  │                                          │ │
-   │  │  Rate Limiter → Circuit Breaker → Retry  │ │
-   │  │       → Bulkhead → Timeout Cascade       │ │
+   │  │  限流器 → 熔断器 → 重试器 → 舱壁 → 超时  │ │
    │  └──────────────────────────────────────────┘ │
    │                     │                          │
    │  ┌──────────────────────────────────────────┐ │
-   │  │         Routing Engine                    │ │
-   │  │   Rule-based + keyword matching → Model  │ │
+   │  │         路由引擎                          │ │
+   │  │  规则匹配 + 关键词 → 选择目标模型         │ │
    │  └──────────────────────────────────────────┘ │
    │                     │                          │
    │  ┌──────────────────────────────────────────┐ │
-   │  │         Observability                     │ │
-   │  │   Token tracking, cost estimation,       │ │
-   │  │   SQLite persistence, Dashboard API      │ │
+   │  │         可观测层                          │ │
+   │  │  Token 实时解析, 成本估算,               │ │
+   │  │  SQLite 持久化, Dashboard API            │ │
    │  └──────────────────────────────────────────┘ │
    └────┬──────────────────────────────────────────┘
         │
@@ -48,90 +47,98 @@ Claude Code / AI Client
    └─────────┘  └─────────┘  └─────────┘
 ```
 
-## Project Structure
+## 项目结构
 
 ```
 ragent-router/
-├── backend/                          # Go backend
-│   ├── cmd/server/main.go            # HTTP server entry point
+├── backend/                          # Go 后端
+│   ├── cmd/server/main.go            # HTTP 服务入口
 │   ├── internal/
-│   │   ├── resilience/               # ★ Core: resilience engine
-│   │   │   ├── circuitbreaker/       #   3-state breaker + sliding window
-│   │   │   ├── ratelimit/            #   Token bucket + sharded store
-│   │   │   ├── retry/                #   Exponential backoff + 3 jitter strategies
-│   │   │   ├── bulkhead/             #   Semaphore concurrency limiter
-│   │   │   └── timeout/              #   Context cascading deadlines
-│   │   ├── proxy/                    # Anthropic SSE streaming proxy
-│   │   ├── routing/                  # Keyword-based rule engine
-│   │   └── store/                    # SQLite persistence + analytics
-│   └── demo/demo_test.go             # 8 integration test scenarios
+│   │   ├── resilience/               # ★ 核心：韧性引擎
+│   │   │   ├── circuitbreaker/       #   三态熔断器 + 滑动窗口
+│   │   │   ├── ratelimit/            #   令牌桶 + 分片锁存储
+│   │   │   ├── retry/                #   指数退避 + 3 种 Jitter 策略
+│   │   │   ├── bulkhead/             #   信号量舱壁隔离
+│   │   │   └── timeout/              #   Context 级联超时
+│   │   ├── proxy/                    # Anthropic SSE 流式代理
+│   │   ├── routing/                  # 关键词规则路由引擎
+│   │   └── store/                    # SQLite 持久化 + 分析查询
+│   └── demo/demo_test.go             # 8 个集成测试场景
 │
-├── frontend/                         # React dashboard (Electron)
+├── frontend/                         # React Dashboard (Electron)
 │   ├── src/
-│   │   ├── api/index.ts              # API client
-│   │   ├── pages/Dashboard.tsx       # Dashboard page
-│   │   ├── pages/TrafficMonitor.tsx  # Traffic monitoring
-│   │   └── components/               # Charts, tables, settings
+│   │   ├── api/index.ts              # API 调用层
+│   │   ├── pages/Dashboard.tsx       # 仪表盘页面
+│   │   ├── pages/TrafficMonitor.tsx  # 流量监控页面
+│   │   └── components/               # 图表、表格、设置组件
 │   └── package.json
 │
 └── README.md
 ```
 
-## Technical Highlights
+## 技术亮点
 
-### 1. Circuit Breaker — Three-State + Sliding Window
+### 1. 熔断器 — 三态状态机 + 滑动窗口
 
 ```
-Closed ──(failure rate > threshold)──→ Open
-Open   ──(timeout expires)───────────→ HalfOpen
-HalfOpen ──(probe succeeds)──────────→ Closed
-HalfOpen ──(probe fails)─────────────→ Open
+Closed   ──(失败率超过阈值)──→ Open
+Open     ──(冷却时间到期)───→ HalfOpen
+HalfOpen ──(探测请求成功)───→ Closed
+HalfOpen ──(探测请求失败)───→ Open
 ```
 
-- Failure rate computed over a sliding window of configurable time buckets
-- Per-provider circuit breakers isolate failures independently
-- Half-open state only permits a configurable number of probe requests
+- 基于滑动时间窗口统计失败率，避免固定窗口的边界效应
+- 每个上游供应商独立熔断，故障隔离互不影响
+- 半开状态只允许配置数量的探测请求通过，防止流量冲击刚恢复的服务
 
-### 2. Token Bucket — Lazy Refill + Sharded Lock
+### 2. 令牌桶限流 — Lazy Refill + 分片锁
 
-The common path (tokens available) costs **one mutex lock + one integer decrement**. Time-based refill is deferred until the bucket empties, avoiding `time.Now()` syscall overhead on every request.
+热路径（Token 充足时）只需 **一次 Mutex 加锁 + 一次整数递减**。时间差计算推迟到桶耗尽时才执行，避免每次请求都调用 `time.Now()`。
 
 ```
 BenchmarkTokenBucket_Allow-32    42440167    28.32 ns/op    0 B/op    0 allocs/op
 ```
 
-Under the hood, the rate limiter store uses **FNV-64a hashing** to distribute keys across **2048 shards**, each protected by its own `sync.RWMutex`. The `Load` path uses **double-checked locking** to avoid write-lock contention on cache hits:
+底层存储采用 **FNV-64a 哈希**将 key 分散到 **2048 个分片**，每个分片持有独立的 `sync.RWMutex`。`Load` 路径使用 **Double-Checked Locking** 避免写锁竞争：
 
 ```go
-// Fast path: optimistic read (no contention)
+// 快速路径：乐观读（无竞争）
 sh.mu.RLock()
 v, ok := sh.data[key]
 sh.mu.RUnlock()
 if ok { return v }
 
-// Slow path: write lock + double-check (only on miss)
+// 慢速路径：写锁 + 二次检查（仅在缓存未命中时）
 sh.mu.Lock()
-v, ok = sh.data[key]  // ← re-check to prevent TOCTOU race
+v, ok = sh.data[key]  // ← 二次确认，防止 TOCTOU 竞争
 if ok { return v }
 sh.data[key] = newVal
 sh.mu.Unlock()
 ```
 
-### 3. Retry — Jitter Strategies
+### 3. 重试策略 — Jitter 抖动
 
-| Strategy | Formula | Best For |
+| 策略 | 公式 | 适用场景 |
 |---|---|---|
-| Full Jitter | `random(0, cap)` | Avoiding thundering herd |
-| Equal Jitter | `cap/2 + random(0, cap/2)` | Balanced timing + spread |
-| Decorrelated Jitter | `min(cap, random(base, cap×3))` | Independent retry timing across nodes |
+| Full Jitter | `random(0, cap)` | 防止惊群效应 |
+| Equal Jitter | `cap/2 + random(0, cap/2)` | 兼顾定时精度与分散 |
+| Decorrelated Jitter | `min(cap, random(base, cap×3))` | 跨节点独立重试时序 |
 
-### 4. Context Cascading Timeout
+### 4. Context 级联超时
 
-Child deadlines are constrained by their parent. A retry loop with 10s per-attempt won't accidentally run for 50s if the parent has a 30s budget.
+子 deadline 受父约束。重试循环中每次 10 秒超时，不会因为没设父 deadline 而实际跑了 50 秒。
 
-### 5. Provider Adapter Pattern
+```go
+rootCtx := timeout.Cascading(ctx, 30*time.Second)   // 总预算 30s
+for i := 0; i < 3; i++ {
+    attemptCtx := timeout.Cascading(rootCtx, 10*time.Second) // 每次尝试受父约束
+    doRequest(attemptCtx)
+}
+```
 
-Abstracts protocol differences between AI providers. The proxy speaks Anthropic Messages API natively; adapters translate to provider-specific formats:
+### 5. 供应商适配器模式
+
+通过接口抽象屏蔽不同 AI 供应商的协议差异。代理层统一使用 Anthropic Messages API 格式，适配器负责翻译为供应商原生格式：
 
 ```go
 type ProviderAdapter interface {
@@ -140,36 +147,36 @@ type ProviderAdapter interface {
 }
 ```
 
-New providers only need to implement this interface — no changes to the proxy core.
+新增供应商只需实现此接口，代理核心代码无需修改。
 
-## Quick Start
+## 快速开始
 
-### Prerequisites
+### 环境要求
 
 - Go 1.22+
 - Node.js 18+
 
-### Backend
+### 后端
 
 ```bash
 cd backend
 
-# Install dependencies
+# 安装依赖
 GOPROXY=https://goproxy.cn,direct go mod download
 
-# Run (with default providers from env vars)
+# 通过环境变量配置供应商后启动
 DEEPSEEK_API_KEY=sk-your-key \
 CLAUDE_API_KEY=sk-ant-your-key \
 go run ./cmd/server
 
-# Or configure via JSON
+# 或通过 JSON 配置
 PROVIDERS='[{"id":"1","name":"DeepSeek","base_url":"https://api.deepseek.com","api_key":"sk-...","model":"deepseek-chat","enabled":true}]' \
 go run ./cmd/server
 ```
 
-The server starts on `http://localhost:15722`.
+服务启动在 `http://localhost:15722`。
 
-### Frontend
+### 前端
 
 ```bash
 cd frontend
@@ -177,86 +184,87 @@ npm install
 npm start
 ```
 
-### Test
+### 测试
 
 ```bash
 cd backend
-go test -v ./demo/          # 8 integration scenarios
-go test -bench=. ./demo/    # Benchmarks
+go test -v ./demo/          # 8 个集成测试场景
+go test -bench=. ./demo/    # 性能基准测试
 ```
 
-## API Endpoints
+## API 端点
 
-### Proxy (Anthropic-compatible)
+### 代理（Anthropic 兼容）
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/messages` | SSE streaming proxy (Claude Code calls this) |
-| GET | `/v1/messages` | Health check |
+| POST | `/v1/messages` | SSE 流式代理（Claude Code 调用此端点） |
+| GET | `/v1/messages` | 健康检查 |
 
 ### Dashboard
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/dashboard/overview` | Today/month cost, total requests |
-| GET | `/api/dashboard/model-distribution` | Requests per model with percentages |
-| GET | `/api/dashboard/recent-routes` | Recent request log (configurable limit) |
-| GET | `/api/dashboard/cost-trend` | Daily cost + request count timeline |
+| GET | `/api/dashboard/overview` | 今日/本月费用、总请求数 |
+| GET | `/api/dashboard/model-distribution` | 各模型请求分布及占比 |
+| GET | `/api/dashboard/recent-routes` | 最近请求日志（可配置条数） |
+| GET | `/api/dashboard/cost-trend` | 每日费用 + 请求量趋势 |
 
-### Monitoring
+### 监控
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/monitor/overview` | Aggregate stats (tokens, cost, latency, errors) |
-| GET | `/api/monitor/recent` | Raw request log entries |
-| GET | `/api/monitor/by-model` | Per-model latency + cost breakdown |
+| GET | `/api/monitor/overview` | 聚合统计（Token、费用、延迟、错误） |
+| GET | `/api/monitor/recent` | 原始请求日志 |
+| GET | `/api/monitor/by-model` | 各模型延迟 + 费用明细 |
 
-### Provider Management
+### 供应商管理
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/proxy/current` | Currently active provider |
-| POST | `/api/proxy/activate/{id}` | Switch active provider |
-| GET | `/api/proxy/health` | System health + warnings |
-| GET | `/api/ccswitch/providers` | List all registered providers |
+| GET | `/api/proxy/current` | 当前活跃供应商 |
+| POST | `/api/proxy/activate/{id}` | 切换活跃供应商 |
+| GET | `/api/proxy/health` | 系统健康状态 + 告警 |
+| GET | `/api/ccswitch/providers` | 已注册供应商列表 |
 
-### Resilience
+### 韧性引擎
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/resilience/stats` | Per-provider circuit breaker states |
+| GET | `/api/resilience/stats` | 各供应商熔断器状态 |
 
-### Health
+### 健康检查
 
-| Method | Path | Description |
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | Service health check |
+| GET | `/health` | 服务探活 |
 
-## Routing Rules
+## 路由规则
 
-Default rules (configurable via code):
+默认规则（可通过代码配置）：
 
-| Rule | Keywords | Target | Priority |
+| 规则 | 关键词 | 目标模型 | 优先级 |
 |---|---|---|---|
-| Architecture & Design | architecture, design, refactor, 架构, 设计 | Claude | 100 |
-| Bug Fix & Debugging | bug, fix, debug, error, 修复, 调试 | Claude | 90 |
-| Code Generation | generate, create, implement, 生成, 创建 | Claude | 80 |
-| Complex Analysis | analyze, review, explain (with >300 token prompt) | Claude | 70 |
-| Simple Questions | explain, what is, how to, 解释, 什么是 | DeepSeek | 50 |
-| Documentation | document, readme, doc, 文档 | DeepSeek | 40 |
+| 架构与设计 | architecture, design, refactor, 架构, 设计, 重构 | Claude | 100 |
+| Bug 修复与调试 | bug, fix, debug, error, 修复, 调试 | Claude | 90 |
+| 代码生成 | generate, create, implement, 生成, 创建 | Claude | 80 |
+| 复杂分析 | analyze, review (提示词 >300 token) | Claude | 70 |
+| 简单问答 | explain, what is, how to, 解释, 什么是 | DeepSeek | 50 |
+| 文档 | document, readme, doc, 文档 | DeepSeek | 40 |
 
-Unmatched requests default to DeepSeek (most cost-efficient).
+未命中任何规则的请求默认路由到 DeepSeek（最具成本效益）。
 
-## Tech Stack
+## 技术栈
 
-| Layer | Technology |
+| 层级 | 技术选型 |
 |---|---|
-| Backend | Go 1.22+ |
-| HTTP Server | `net/http` (standard library) |
-| Database | SQLite (`modernc.org/sqlite`, pure Go, no CGO) |
-| Frontend | React + TypeScript + Ant Design + Recharts |
-| Desktop | Electron + Vite |
-| State | Zustand |
+| 后端语言 | Go 1.22+ |
+| HTTP 服务 | `net/http`（标准库，零外部依赖） |
+| 数据库 | SQLite（`modernc.org/sqlite`，纯 Go 无 CGO） |
+| 前端框架 | React + TypeScript |
+| UI 组件 | Ant Design + Recharts |
+| 桌面环境 | Electron + Vite |
+| 状态管理 | Zustand |
 
 ## License
 
