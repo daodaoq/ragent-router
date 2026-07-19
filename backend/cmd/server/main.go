@@ -32,7 +32,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/ragent/router/internal/api"
 	"github.com/ragent/router/internal/provider"
+	"github.com/ragent/router/internal/orchestrator"
 	"github.com/ragent/router/internal/proxy"
+	proxymw "github.com/ragent/router/internal/proxy/middleware"
 	"github.com/ragent/router/internal/routing"
 	"github.com/ragent/router/internal/semcache"
 	"github.com/ragent/router/internal/store"
@@ -193,6 +195,22 @@ func main() {
 	} else {
 		log.Println("[缓存] Embedding 服务未配置，语义缓存已禁用")
 	}
+
+	// ── 初始化多模型编排引擎 ──
+	if len(providers) >= 2 {
+		caller := p.NewOrchestratorCaller()
+		orchEngine := orchestrator.New(caller)
+		p.Orchestrator = proxy.NewOrchestratorAdapter(orchEngine, p)
+		log.Printf("[编排] 多模型编排已启用（%d 个供应商可用）", len(providers))
+	} else {
+		log.Println("[编排] 供应商不足 2 个，多模型编排已禁用")
+	}
+
+	// ── 初始化中间件管线 ──
+	p.Pipeline = proxy.NewPipeline(
+		&proxymw.PromptAnalyzer{}, // Demo: 自动分析 prompt 复杂度
+	)
+	log.Printf("[管线] 已注册 %d 个中间件", p.Pipeline.Len())
 
 	// ── 构建 HTTP 路由 ──
 	mux := http.NewServeMux()

@@ -82,6 +82,12 @@ type Proxy struct {
 	// 语义缓存：非 nil 时启用缓存检查（在路由之前）。
 	Cache SemanticCache
 
+	// 编排引擎：非 nil 时支持 X-Ragent-Orchestrate 头触发多模型编排。
+	Orchestrator Orchestrator
+
+	// 中间件管线：在路由前执行请求处理，在响应后执行后处理。
+	Pipeline *Pipeline
+
 	// 调试锁定：非空时强制路由到指定供应商（绕过路由引擎）。
 	// 受 debugMu 保护。
 	debugProvider string
@@ -94,12 +100,22 @@ type RouteMatcher interface {
 }
 
 // SemanticCache 是语义缓存的接口。
-// 在路由之前检查缓存——如果 prompt 与历史请求语义相似，直接返回缓存结果。
 type SemanticCache interface {
-	// Lookup 查找语义相似的缓存响应。返回 nil 表示未命中。
 	Lookup(ctx context.Context, prompt string) (responseBody []byte, similarity float64, ok bool)
-	// Store 保存响应到缓存，供后续 Lookup 使用。
 	Store(prompt string, responseBody []byte, provider, model string, tokens int)
+}
+
+// Orchestrator 是多模型编排的接口。
+type Orchestrator interface {
+	// Execute 执行编排策略并以 SSE 流式写回。
+	Execute(ctx context.Context, w http.ResponseWriter, req *OrchestrateRequest) error
+}
+
+// OrchestrateRequest 是一次编排请求。
+type OrchestrateRequest struct {
+	GeneratorName string                 // 生成模型供应商名
+	ReviewerName  string                 // 审查模型供应商名
+	Body          map[string]interface{} // 原始请求体
 }
 
 // RequestLog 是一次代理请求完成后的日志记录。
@@ -284,6 +300,52 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 			}
 			return nil
 		}
+	}
+
+	// ── 步骤 2.6：中间件管线（请求阶段）──
+	if p.Pipeline != nil && p.Pipeline.Len() > 0 {
+		modified, err := p.Pipeline.ExecuteRequest(r.Context(), bodyJSON, r.Header)
+		if err != nil {
+			log.Printf("[管线] 请求被中断: %v", err)
+			http.Error(w, `{"error":"request blocked by pipeline"}`, http.StatusForbidden)
+			return nil
+		}
+		bodyJSON = modified
+	}
+
+	// ── 步骤 2.7：多模型编排检查 ──
+	if p.Orchestrator != nil && r.Header.Get("X-Ragent-Orchestrate") == "review" {
+		log.Printf("[编排] 触发 review 模式")
+		genName := r.Header.Get("X-Ragent-Generator")
+		revName := r.Header.Get("X-Ragent-Reviewer")
+		if genName == "" {
+			genName = "DeepSeek"
+		}
+		if revName == "" {
+			revName = "Claude"
+		}
+		orchErr := p.Orchestrator.Execute(r.Context(), w, &OrchestrateRequest{
+			GeneratorName: genName,
+			ReviewerName:  revName,
+			Body:          bodyJSON,
+		})
+		if orchErr != nil {
+			log.Printf("[编排] 执行失败: %v", orchErr)
+		}
+		if p.OnRequestLog != nil {
+			p.OnRequestLog(RequestLog{
+				RequestID:   tracking.RequestID,
+				Prompt:      prompt,
+				Provider:    fmt.Sprintf("orch:%s+%s", genName, revName),
+				Model:       modelName,
+				RouteReason: "orchestration:review",
+				Status:      statusFromErr(orchErr),
+				ErrorDetail: errDetail(orchErr),
+				LatencyMs:   time.Since(startTime).Milliseconds(),
+				Timestamp:   startTime,
+			})
+		}
+		return nil
 	}
 
 	// 调试锁定：如果设置了 debugProvider，直接使用（绕过路由引擎）。
@@ -531,6 +593,20 @@ func extractPrompt(body map[string]interface{}) string {
 
 func joinStrings(parts []string, sep string) string {
 	return strings.Join(parts, sep)
+}
+
+func statusFromErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
+}
+
+func errDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // ────────────────────────────────────────────────────────────
