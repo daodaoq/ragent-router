@@ -21,23 +21,13 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/ragent/router/internal/provider"
 )
 
-// ────────────────────────────────────────────────────────────
-// 供应商配置
-// ────────────────────────────────────────────────────────────
-
-// ProviderConfig 是一个上游 AI 供应商的完整配置。
-// 可通过环境变量或 JSON 配置文件注入。
-type ProviderConfig struct {
-	ID      string            `json:"id"`       // 唯一标识
-	Name    string            `json:"name"`     // 显示名称（如 "DeepSeek", "Claude"）
-	BaseURL string            `json:"base_url"` // API 基础地址
-	APIKey  string            `json:"api_key"`  // 认证密钥
-	Model   string            `json:"model"`    // 默认模型名
-	Headers map[string]string `json:"headers"`  // 额外的请求头
-	Enabled bool              `json:"enabled"`  // 是否启用
-}
+// ProviderConfig 是对 provider.Config 的类型别名，保持向后兼容。
+// 核心类型定义在 internal/provider 包，proxy 和 routing 包共同依赖。
+type ProviderConfig = provider.Config
 
 // ────────────────────────────────────────────────────────────
 // 适配器接口
@@ -180,20 +170,22 @@ func translateMessages(body map[string]interface{}) []map[string]interface{} {
 // 适配器工厂
 // ────────────────────────────────────────────────────────────
 
-// AdapterFor 根据供应商名称选择适配器。
-//
-// 规则：
-//   - 名称含 "openai"/"deepseek"/"minimax"/"bailian" → OpenAI 适配器（Chat Completions 格式）
-//   - 其他 → Anthropic 适配器（原生 Messages API 格式）
-func AdapterFor(providerName string) ProviderAdapter {
+// 适配器是无状态的，使用单例避免每次请求都分配新对象。
+var (
+	anthropicAdapter = &AnthropicAdapter{}
+	openaiAdapter    = &OpenAIAdapter{}
+)
+
+// adapterFor 根据供应商名称选择适配器（内部使用）。
+func adapterFor(providerName string) ProviderAdapter {
 	lower := strings.ToLower(providerName)
 	openaiCompat := []string{"openai", "deepseek", "minimax", "bailian"}
 	for _, keyword := range openaiCompat {
 		if strings.Contains(lower, keyword) {
-			return &OpenAIAdapter{}
+			return openaiAdapter
 		}
 	}
-	return &AnthropicAdapter{}
+	return anthropicAdapter
 }
 
 // AdapterFactory 是适配器的注册表，支持自定义适配器。
@@ -201,7 +193,7 @@ type AdapterFactory struct {
 	adapters map[string]ProviderAdapter
 }
 
-// NewAdapterFactory 创建空的适配器工厂。
+// NewAdapterFactory 创建适配器工厂并预注册默认适配器。
 func NewAdapterFactory() *AdapterFactory {
 	return &AdapterFactory{
 		adapters: make(map[string]ProviderAdapter),
@@ -209,12 +201,17 @@ func NewAdapterFactory() *AdapterFactory {
 }
 
 // Get 返回供应商的适配器。
-// 如果工厂中有注册的自定义适配器则使用，否则回退到 AdapterFor 的默认规则。
+// 优先使用工厂中注册的自定义适配器，否则回退到默认规则。
 func (f *AdapterFactory) Get(providerName string) ProviderAdapter {
 	if adapter, ok := f.adapters[providerName]; ok {
 		return adapter
 	}
-	return AdapterFor(providerName)
+	return adapterFor(providerName)
+}
+
+// Register 注册自定义适配器（用于特殊供应商/测试）。
+func (f *AdapterFactory) Register(name string, adapter ProviderAdapter) {
+	f.adapters[name] = adapter
 }
 
 // ────────────────────────────────────────────────────────────
@@ -222,13 +219,12 @@ func (f *AdapterFactory) Get(providerName string) ProviderAdapter {
 // ────────────────────────────────────────────────────────────
 
 // ValidateProvider 检查供应商配置是否可用。
-// 规则：必须有 BaseURL、必须有 APIKey、不能代理到自己。
-func ValidateProvider(cfg *ProviderConfig) error {
+func ValidateProvider(cfg *provider.Config) error {
 	return ValidateProviderWithPort(cfg, 15722)
 }
 
 // ValidateProviderWithPort 检查供应商配置是否可用（支持自定义端口）。
-func ValidateProviderWithPort(cfg *ProviderConfig, selfPort int) error {
+func ValidateProviderWithPort(cfg *provider.Config, selfPort int) error {
 	if cfg.BaseURL == "" {
 		return fmt.Errorf("provider %q: base_url is required", cfg.Name)
 	}

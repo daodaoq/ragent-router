@@ -10,9 +10,11 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ragent/router/internal/provider"
 	"github.com/ragent/router/internal/resilience/bulkhead"
 	"github.com/ragent/router/internal/resilience/circuitbreaker"
 	"github.com/ragent/router/internal/resilience/ratelimit"
@@ -53,7 +55,8 @@ type Proxy struct {
 	providers map[string]*ProviderConfig
 
 	// 每个供应商一个独立的熔断器——故障隔离
-	breakers map[string]*circuitbreaker.CircuitBreaker
+	breakers  map[string]*circuitbreaker.CircuitBreaker
+	breakerMu sync.Mutex // 保护 breakers map 的并发读写
 
 	// 全局限流器——所有供应商共享
 	limiter *ratelimit.TokenBucket
@@ -70,11 +73,16 @@ type Proxy struct {
 	// HTTP 客户端（连接池复用）
 	client *http.Client
 
+	// 韧性参数配置
+	resilience provider.ResilienceConfig
+
 	// 请求日志回调——每次请求完成后调用
 	OnRequestLog func(log RequestLog)
 
 	// 调试锁定：非空时强制路由到指定供应商（绕过路由引擎）。
+	// 受 debugMu 保护。
 	debugProvider string
+	debugMu       sync.RWMutex
 }
 
 // RouteMatcher 是路由选择的接口。
@@ -108,11 +116,12 @@ type RequestLog struct {
 
 // Config 是创建 Proxy 的配置参数。
 type Config struct {
-	Providers             []ProviderConfig // 供应商列表
-	Matcher               RouteMatcher     // 路由引擎
-	HTTPClient            *http.Client     // HTTP 客户端（nil 则使用默认值）
-	GlobalRateLimit       float64          // 全局限流速率（Token/秒）
-	MaxConcurrentRequests int              // 最大并发请求数（舱壁容量）
+	Providers             []ProviderConfig         // 供应商列表
+	Matcher               RouteMatcher             // 路由引擎
+	HTTPClient            *http.Client             // HTTP 客户端（nil 则使用默认值）
+	GlobalRateLimit       float64                  // 全局限流速率（Token/秒）
+	MaxConcurrentRequests int                      // 最大并发请求数（舱壁容量）
+	Resilience            *provider.ResilienceConfig // 可选：韧性参数（nil 使用默认值）
 }
 
 // NewProxy 创建一个新的 AI API 网关实例。
@@ -134,14 +143,21 @@ func NewProxy(cfg Config) *Proxy {
 		}
 	}
 
+	rc := cfg.Resilience
+	if rc == nil {
+		d := provider.DefaultResilienceConfig()
+		rc = &d
+	}
+
 	p := &Proxy{
 		providers: make(map[string]*ProviderConfig),
 		breakers:  make(map[string]*circuitbreaker.CircuitBreaker),
 		limiter:   ratelimit.NewTokenBucket(cfg.GlobalRateLimit, uint64(cfg.GlobalRateLimit)),
 		bulkhead:  bulkhead.New(cfg.MaxConcurrentRequests),
 		matcher:   cfg.Matcher,
-		adapters:  NewAdapterFactory(),
-		client:    cfg.HTTPClient,
+		adapters:   NewAdapterFactory(),
+		client:     cfg.HTTPClient,
+		resilience: *rc,
 	}
 
 	// 注册供应商，为每个创建独立的熔断器。
@@ -150,8 +166,8 @@ func NewProxy(cfg Config) *Proxy {
 		if prov.Enabled {
 			p.providers[prov.Name] = prov
 			cbCfg := circuitbreaker.DefaultConfig()
-			cbCfg.FailureThreshold = 0.5
-			cbCfg.OpenTimeout = 30 * time.Second
+			cbCfg.FailureThreshold = rc.FailureThreshold
+			cbCfg.OpenTimeout = rc.OpenTimeout
 			p.breakers[prov.Name] = circuitbreaker.New(cbCfg)
 		}
 	}
@@ -183,7 +199,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ═══ 韧性层 2：舱壁隔离 ═══
-	reqCtx, cancel := context.WithTimeout(r.Context(), 300*time.Second)
+	reqCtx, cancel := context.WithTimeout(r.Context(), p.resilience.RequestTimeout)
 	defer cancel()
 
 	err := p.bulkhead.Execute(reqCtx, func() error {
@@ -225,8 +241,11 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 
 	// 调试锁定：如果设置了 debugProvider，直接使用（绕过路由引擎）。
 	var provider *ProviderConfig
-	if p.debugProvider != "" {
-		if pv, ok := p.providers[p.debugProvider]; ok && pv.Enabled {
+	p.debugMu.RLock()
+	debugProv := p.debugProvider
+	p.debugMu.RUnlock()
+	if debugProv != "" {
+		if pv, ok := p.providers[debugProv]; ok && pv.Enabled {
 			provider = pv
 			log.Printf("[路由] 调试锁定 → %s (绕过路由引擎)", provider.Name)
 		}
@@ -247,13 +266,8 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 	}
 	log.Printf("[路由] → %s (model=%s)", provider.Name, modelName)
 
-	// ── 步骤 3：获取或创建供应商熔断器 ──
-	breaker := p.breakers[provider.Name]
-	if breaker == nil {
-		cbCfg := circuitbreaker.DefaultConfig()
-		breaker = circuitbreaker.New(cbCfg)
-		p.breakers[provider.Name] = breaker
-	}
+	// ── 步骤 3：获取或创建供应商熔断器（线程安全）──
+	breaker := p.getOrCreateBreaker(provider.Name)
 
 	// ── 步骤 4：初始化追踪 ──
 	tracking := &RequestTracking{
@@ -345,12 +359,12 @@ func (p *Proxy) doUpstreamRequest(
 
 	// 可重试：发送上游请求 + 检查响应状态。
 	retryCfg := retry.DefaultConfig()
-	retryCfg.MaxAttempts = 2
+	retryCfg.MaxAttempts = p.resilience.MaxRetries
 	backoff := retry.NewExponentialBackoff(retryCfg)
 
 	var resp *http.Response
 	err = retry.Do(r.Context(), backoff, backoff.MaxAttempts(), func() error {
-		upstreamCtx, cancel := timeout.Cascading(r.Context(), 120*time.Second)
+		upstreamCtx, cancel := timeout.Cascading(r.Context(), p.resilience.UpstreamTimeout)
 		defer cancel()
 
 		bodyReader := bytes.NewReader(reqBody)
@@ -473,27 +487,13 @@ func joinStrings(parts []string, sep string) string {
 // ────────────────────────────────────────────────────────────
 
 // estimateCost 根据供应商和模型名称估算 API 调用费用。
-//
-// 使用硬编码的费率表（美元/百万 Token）：
-//
-//	Claude:  $3.00/M input,  $15.00/M output
-//	DeepSeek: $0.27/M input, $1.10/M output
-//	OpenAI:   $2.50/M input, $10.00/M output
-//
-// 注意：实际费率会变化，生产环境应改为数据库配置或 API 查询。
-func estimateCost(provider, model string, inputTokens, outputTokens int) float64 {
-	type rate struct{ input, output float64 }
-	rates := map[string]rate{
-		"deepseek": {0.27, 1.10},
-		"claude":   {3.00, 15.00},
-		"openai":   {2.50, 10.00},
-		"minimax":  {0.30, 1.20},
-		"bailian":  {0.40, 1.20},
-	}
+// 费率表定义在 internal/provider/cost.go，可随供应商调价更新。
+func estimateCost(providerName, model string, inputTokens, outputTokens int) float64 {
+	rates := provider.DefaultRates()
 
 	for keyword, r := range rates {
-		if strings.Contains(provider, keyword) || strings.Contains(model, keyword) {
-			cost := (float64(inputTokens)*r.input + float64(outputTokens)*r.output) / 1_000_000
+		if strings.Contains(providerName, keyword) || strings.Contains(model, keyword) {
+			cost := (float64(inputTokens)*r.Input + float64(outputTokens)*r.Output) / 1_000_000
 			return float64(int(cost*10000)) / 10000 // 保留 4 位小数
 		}
 	}
@@ -505,19 +505,20 @@ func estimateCost(provider, model string, inputTokens, outputTokens int) float64
 // ────────────────────────────────────────────────────────────
 
 // AddProvider 运行时注册新供应商，同时创建对应的熔断器。
-// 注意：此方法主要用于初始化阶段。运行时调用需自行确保不与 Match 并发调用。
 func (p *Proxy) AddProvider(cfg ProviderConfig) {
 	cfg.Enabled = true
 	p.providers[cfg.Name] = &cfg
-	cbCfg := circuitbreaker.DefaultConfig()
-	p.breakers[cfg.Name] = circuitbreaker.New(cbCfg)
+	p.breakerMu.Lock()
+	p.breakers[cfg.Name] = circuitbreaker.New(circuitbreaker.DefaultConfig())
+	p.breakerMu.Unlock()
 }
 
 // RemoveProvider 移除供应商及其熔断器。
-// 注意：此方法主要用于初始化阶段。运行时调用需自行确保不与 Match 并发调用。
 func (p *Proxy) RemoveProvider(name string) {
 	delete(p.providers, name)
+	p.breakerMu.Lock()
 	delete(p.breakers, name)
+	p.breakerMu.Unlock()
 }
 
 // GetProvider 按名称获取供应商配置。
@@ -537,6 +538,8 @@ func (p *Proxy) ListProviders() []*ProviderConfig {
 // SetDebugProvider 设置为调试锁定模式——所有请求强制路由到指定供应商。
 // 传入空字符串清除锁定，恢复正常路由。
 func (p *Proxy) SetDebugProvider(name string) bool {
+	p.debugMu.Lock()
+	defer p.debugMu.Unlock()
 	if name == "" {
 		p.debugProvider = ""
 		return true
@@ -550,12 +553,30 @@ func (p *Proxy) SetDebugProvider(name string) bool {
 
 // GetDebugProvider 返回当前调试锁定的供应商名（空=未锁定）。
 func (p *Proxy) GetDebugProvider() string {
+	p.debugMu.RLock()
+	defer p.debugMu.RUnlock()
 	return p.debugProvider
+}
+
+// getOrCreateBreaker 线程安全地获取或创建指定供应商的熔断器。
+func (p *Proxy) getOrCreateBreaker(name string) *circuitbreaker.CircuitBreaker {
+	p.breakerMu.Lock()
+	defer p.breakerMu.Unlock()
+	if cb, ok := p.breakers[name]; ok {
+		return cb
+	}
+	cbCfg := circuitbreaker.DefaultConfig()
+	cb := circuitbreaker.New(cbCfg)
+	p.breakers[name] = cb
+	return cb
 }
 
 // BreakerStats 返回指定供应商的熔断器状态。
 func (p *Proxy) BreakerStats(name string) *circuitbreaker.Stats {
-	if cb, ok := p.breakers[name]; ok {
+	p.breakerMu.Lock()
+	cb, ok := p.breakers[name]
+	p.breakerMu.Unlock()
+	if ok {
 		s := cb.Stats()
 		return &s
 	}

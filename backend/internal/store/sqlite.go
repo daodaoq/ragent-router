@@ -263,31 +263,31 @@ func (s *LogStore) CostTrend(days int) ([]CostTrendPoint, error) {
 }
 
 // MonitorOverview 返回监控页面的聚合数据（今日实时统计）。
-func (s *LogStore) MonitorOverview() (map[string]interface{}, error) {
+func (s *LogStore) MonitorOverview() (*MonitorOverviewData, error) {
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
-	var todayRequests, errorCount, totalTokens int64
+	var data MonitorOverviewData
 	var avgLatencyMs float64
 
 	// 今日请求总数
 	if err := s.db.QueryRow(
 		"SELECT COUNT(1) FROM request_logs WHERE created_at >= ?", todayStart,
-	).Scan(&todayRequests); err != nil {
+	).Scan(&data.TodayRequests); err != nil {
 		return nil, fmt.Errorf("today requests: %w", err)
 	}
 
 	// 今日错误数
 	if err := s.db.QueryRow(
 		"SELECT COUNT(1) FROM request_logs WHERE created_at >= ? AND status = 'error'", todayStart,
-	).Scan(&errorCount); err != nil {
+	).Scan(&data.ErrorCount); err != nil {
 		return nil, fmt.Errorf("error count: %w", err)
 	}
 
 	// 今日总 Token 数
 	if err := s.db.QueryRow(
 		"SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at >= ?", todayStart,
-	).Scan(&totalTokens); err != nil {
+	).Scan(&data.TotalTokens); err != nil {
 		return nil, fmt.Errorf("total tokens: %w", err)
 	}
 
@@ -297,13 +297,9 @@ func (s *LogStore) MonitorOverview() (map[string]interface{}, error) {
 	).Scan(&avgLatencyMs); err != nil {
 		return nil, fmt.Errorf("avg latency: %w", err)
 	}
+	data.AvgLatencyMs = int(avgLatencyMs)
 
-	return map[string]interface{}{
-		"today_requests": todayRequests,
-		"error_count":    errorCount,
-		"total_tokens":   totalTokens,
-		"avg_latency_ms": int(avgLatencyMs),
-	}, nil
+	return &data, nil
 }
 
 // ByModel 返回各模型的详细统计（按请求次数降序）。

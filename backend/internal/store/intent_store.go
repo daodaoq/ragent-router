@@ -17,9 +17,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -70,7 +68,10 @@ func ToTree(records []IntentNodeRecord) []*IntentNode {
 	for _, r := range records {
 		var examples []string
 		if r.Examples != "" {
-			json.Unmarshal([]byte(r.Examples), &examples)
+			if err := json.Unmarshal([]byte(r.Examples), &examples); err != nil {
+				// 解析失败时使用空数组，避免因脏数据导致 panic
+				examples = []string{}
+			}
 		}
 		if examples == nil {
 			examples = []string{}
@@ -296,6 +297,13 @@ func (s *IntentStore) Count() (int, error) {
 
 // SeedDefaults 写入默认意图树（仅在表为空时执行）。
 //
+// 注意：此处的意图数据应与 routing/intents.go 的 DefaultIntents() 保持同步。
+// 如果修改了任一处，请同步更新另一处。两处的字段关系：
+//
+//	DefaultIntents.Provider   (供应商名称)  ↔ provider_id (DB 外键)
+//	DefaultIntents.Description + Examples  ↔ intent_nodes.description + examples
+//	DefaultIntents.IntentCode / Name       ↔ intent_nodes.intent_code / name
+//
 // 默认结构：
 //
 //	编程助手 (Root)
@@ -414,19 +422,8 @@ func migrateIntents(db *sql.DB) error {
 	return err
 }
 
-// ────────────────────────────────────────────────────────────
-// 辅助函数（store 包内部使用）
-// ────────────────────────────────────────────────────────────
-
-// compactPrompt 截断提示词用于展示（与 sqlite.go 中的 CompactPrompt 保持一致）。
+// compactPrompt 截断提示词用于展示（参见 sqlite.go 中的 CompactPrompt）。
 // 按 rune 计数避免中文截断乱码。
 func compactPrompt(prompt string, maxLen int) string {
-	if utf8.RuneCountInString(prompt) <= maxLen {
-		return prompt
-	}
-	runes := []rune(prompt)
-	if len(runes) <= maxLen {
-		return prompt
-	}
-	return strings.TrimSpace(string(runes[:maxLen])) + "..."
+	return CompactPrompt(prompt, maxLen)
 }

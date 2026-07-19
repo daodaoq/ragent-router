@@ -71,12 +71,20 @@ type CostTrendPoint struct {
 	Requests int64   `json:"requests"` // 当日请求数
 }
 
+// MonitorOverviewData 是监控页面的聚合实时数据。
+type MonitorOverviewData struct {
+	TodayRequests int64 `json:"today_requests"` // 今日请求数
+	ErrorCount    int64 `json:"error_count"`    // 今日错误数
+	TotalTokens   int64 `json:"total_tokens"`   // 今日总 Token 数
+	AvgLatencyMs  int   `json:"avg_latency_ms"` // 今日平均延迟（毫秒）
+}
+
 // ProxyHealth 是代理健康检查的响应模型。
 type ProxyHealth struct {
-	CCSwitchDBAvailable bool     `json:"ccswitch_db_available"` // 供应商数据库是否可用
-	StateFileOK         bool     `json:"state_file_ok"`         // 状态文件是否正常
-	ActiveProviderID    string   `json:"active_provider_id"`    // 当前活跃供应商 ID
+	DBOK                bool     `json:"db_ok"`                // 数据库连接是否正常
+	StateFileOK         bool     `json:"state_file_ok"`        // 状态文件是否正常
+	ActiveProviderID    string   `json:"active_provider_id"`   // 当前活跃供应商 ID
 	ActiveProviderValid bool     `json:"active_provider_valid"` // 当前供应商配置是否有效
-	Warnings            []string `json:"warnings"`              // 警告信息列表
-	ProxyReady          bool     `json:"proxy_ready"`           // 代理是否就绪
+	Warnings            []string `json:"warnings"`             // 警告信息列表
+	ProxyReady          bool     `json:"proxy_ready"`          // 代理是否就绪
 }

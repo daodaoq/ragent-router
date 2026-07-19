@@ -104,6 +104,9 @@ func FlattenLeaves(nodes []*IntentNode, providerIDToName map[string]string) []In
 // 注意：生产路由使用 IntentStore 中的持久化数据。
 // 此函数仅在 DB 不可用时的极端回退场景中使用，
 // 或作为首次种子数据的参考模板。
+//
+// ⚠ 与 store/intent_store.go 的 SeedDefaults() 保持同步：
+// 修改此处时请同步更新 SeedDefaults 中的对应记录，反之亦然。
 func DefaultIntents() []Intent {
 	return []Intent{
 		{

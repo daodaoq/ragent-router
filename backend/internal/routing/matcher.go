@@ -29,7 +29,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ragent/router/internal/proxy"
+	"github.com/ragent/router/internal/provider"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ type Rule struct {
 // Aho-Corasick 或 trie 优化关键词匹配。
 type RuleEngine struct {
 	rules           []Rule                          // 按优先级降序排列的规则列表
-	providers       map[string]*proxy.ProviderConfig // 供应商注册表
+	providers       map[string]*provider.Config // 供应商注册表
 	defaultProvider string                          // 无规则命中时的回退供应商
 }
 
@@ -83,7 +83,7 @@ type RuleEngine struct {
 //   - rules：路由规则集（会被复制，不会被修改）
 //   - providers：供应商名称 → 配置的映射
 //   - defaultProvider：无规则命中时的默认供应商名称
-func NewRuleEngine(rules []Rule, providers map[string]*proxy.ProviderConfig, defaultProvider string) *RuleEngine {
+func NewRuleEngine(rules []Rule, providers map[string]*provider.Config, defaultProvider string) *RuleEngine {
 	// 复制并排序（不修改调用方的切片）。
 	sorted := make([]Rule, len(rules))
 	copy(sorted, rules)
@@ -113,7 +113,7 @@ func NewRuleEngine(rules []Rule, providers map[string]*proxy.ProviderConfig, def
 //
 // 仅做关键词匹配，未命中返回 nil。
 // 默认回退逻辑已移至 HybridRouter.Match() 的策略 4 层。
-func (e *RuleEngine) Match(_ context.Context, prompt string, model string) *proxy.ProviderConfig {
+func (e *RuleEngine) Match(_ context.Context, prompt string, model string) *provider.Config {
 	promptLower := strings.ToLower(prompt)
 
 	// 阶段 1：按优先级从高到低匹配关键词规则。

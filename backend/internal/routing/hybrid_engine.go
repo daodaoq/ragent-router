@@ -38,7 +38,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ragent/router/internal/proxy"
+	"github.com/ragent/router/internal/provider"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ type HybridRouter struct {
 	intentMu        sync.RWMutex // 保护 intents / classifyIntents 热重载
 
 	// ── 供应商注册表 ──
-	providers      map[string]*proxy.ProviderConfig
+	providers      map[string]*provider.Config
 	defaultProvider string
 
 	// ── 统计（atomic，无锁）──
@@ -105,7 +105,7 @@ type HybridConfig struct {
 	EmbeddingCacheTTL time.Duration
 
 	// Providers 是供应商名称 → 配置的映射（必填）。
-	Providers map[string]*proxy.ProviderConfig
+	Providers map[string]*provider.Config
 
 	// DefaultProvider 是所有策略都失败时的默认供应商名称（必填）。
 	DefaultProvider string
@@ -259,7 +259,7 @@ func (r *HybridRouter) ReloadIntents(ctx context.Context, intents []Intent) erro
 //
 // ctx 用于 Embedding API 和 LLM 分类器的超时控制。
 // 关键词匹配层不需要 ctx（纯内存计算）。
-func (r *HybridRouter) Match(ctx context.Context, prompt string, model string) *proxy.ProviderConfig {
+func (r *HybridRouter) Match(ctx context.Context, prompt string, model string) *provider.Config {
 	if prompt == "" {
 		return r.fallback()
 	}
@@ -518,7 +518,7 @@ func (r *HybridRouter) GetIntents() []Intent {
 //   - Embedding 生成失败（网络错误等）
 //   - 最高相似度低于阈值（语义不确定）
 //   - 匹配到的意图对应的供应商不可用
-func (r *HybridRouter) semanticMatch(ctx context.Context, prompt string) *proxy.ProviderConfig {
+func (r *HybridRouter) semanticMatch(ctx context.Context, prompt string) *provider.Config {
 	var emb Embedding
 	var ok bool
 
@@ -590,7 +590,7 @@ func (r *HybridRouter) semanticMatch(ctx context.Context, prompt string) *proxy.
 //   - LLM API 调用失败（网络错误、超时等）
 //   - 分类结果解析失败
 //   - 分类结果对应的供应商不可用
-func (r *HybridRouter) classify(ctx context.Context, prompt string) *proxy.ProviderConfig {
+func (r *HybridRouter) classify(ctx context.Context, prompt string) *provider.Config {
 	r.intentMu.RLock()
 	clIntents := r.classifyIntents
 	r.intentMu.RUnlock()
@@ -628,7 +628,7 @@ func (r *HybridRouter) classify(ctx context.Context, prompt string) *proxy.Provi
 // ────────────────────────────────────────────────────────────
 
 // fallback 返回默认供应商，或任意启用的供应商。
-func (r *HybridRouter) fallback() *proxy.ProviderConfig {
+func (r *HybridRouter) fallback() *provider.Config {
 	if prov, ok := r.providers[r.defaultProvider]; ok && prov.Enabled {
 		log.Printf("[路由-默认] → %s", prov.Name)
 		return prov
