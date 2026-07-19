@@ -31,6 +31,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ragent/router/internal/api"
+	"github.com/ragent/router/internal/mock"
 	"github.com/ragent/router/internal/provider"
 	"github.com/ragent/router/internal/orchestrator"
 	"github.com/ragent/router/internal/proxy"
@@ -46,6 +47,16 @@ func main() {
 	dbPath := flag.String("db", "ragent_router.db", "SQLite 数据库路径")
 	flag.Parse()
 
+	// ── Mock 模式：无需 API Key，一键启动完整 Demo ──
+	mockMode := os.Getenv("MOCK_MODE") == "true"
+	if mockMode {
+		log.Println("╔══════════════════════════════════════════════════════╗")
+		log.Println("║       RAgent Router — Mock Demo 模式                 ║")
+		log.Println("║  无需 API Key，所有功能开箱即用                       ║")
+		log.Println("║  Dashboard: http://localhost:15722                   ║")
+		log.Println("╚══════════════════════════════════════════════════════╝")
+	}
+
 	// ── 初始化存储层 ──
 	logStore, err := store.NewLogStore(*dbPath)
 	if err != nil {
@@ -55,10 +66,21 @@ func main() {
 	log.Printf("[启动] 数据库已就绪: %s", *dbPath)
 
 	// ── 加载供应商配置 ──
-	providers := loadProviders()
-	if len(providers) == 0 {
-		log.Println("[警告] 未配置任何供应商——请设置环境变量或 PROVIDERS JSON")
-		log.Println("[警告] 例如：DEEPSEEK_API_KEY=sk-xxx CLAUDE_API_KEY=sk-ant-xxx go run ./cmd/server")
+	var providers []proxy.ProviderConfig
+	var mockEmbedder *mock.MockEmbeddingService
+
+	if mockMode {
+		upstreamAddr, emb, provs := mock.Setup(logStore)
+		providers = provs
+		mockEmbedder = emb
+		log.Printf("[Mock] 供应商: %s (Claude) + %s (DeepSeek)", providers[0].Name, providers[1].Name)
+		log.Printf("[Mock] 上游地址: %s", upstreamAddr)
+	} else {
+		providers = loadProviders()
+		if len(providers) == 0 {
+			log.Println("[警告] 未配置任何供应商——请设置环境变量或 PROVIDERS JSON")
+			log.Println("[警告] 或使用 MOCK_MODE=true 启动 Demo 模式")
+		}
 	}
 
 	// 构建供应商注册表（供路由引擎使用）。
@@ -116,7 +138,11 @@ func main() {
 	classifierConfigured := false
 
 	// ── 可选的 Embedding 语义匹配层 ──
-	if embeddingKey := os.Getenv("EMBEDDING_API_KEY"); embeddingKey != "" {
+	if mockMode && mockEmbedder != nil {
+		hybridCfg.EmbeddingService = mockEmbedder
+		embeddingConfigured = true
+		log.Println("[Mock] Embedding 服务: 已启用（确定性的 mock 向量）")
+	} else if embeddingKey := os.Getenv("EMBEDDING_API_KEY"); embeddingKey != "" {
 		embCfg := routing.OpenAIEmbeddingConfig{
 			Endpoint: getEnv("EMBEDDING_ENDPOINT", "https://api.openai.com/v1/embeddings"),
 			APIKey:   embeddingKey,
@@ -181,10 +207,15 @@ func main() {
 		}
 	}
 
-	// ── 初始化语义缓存（可选，依赖 Embedding 服务）──
+	// ── 初始化语义缓存 ──
+	// Mock 模式下降低阈值到 0.85，使得相似但不完全相同的 prompt 也能命中（展示功能）
 	var cacheService *semcache.Service
 	if embeddingConfigured {
-		cacheStore, err := store.NewSemanticCacheStore(logStore.DB(), 0.92, 1000)
+		cacheThreshold := 0.92
+		if mockMode {
+			cacheThreshold = 0.85 // Mock 模式下放宽阈值，提高命中率
+		}
+		cacheStore, err := store.NewSemanticCacheStore(logStore.DB(), cacheThreshold, 1000)
 		if err != nil {
 			log.Printf("[缓存] 初始化失败: %v", err)
 		} else {
