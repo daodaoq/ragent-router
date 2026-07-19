@@ -1,73 +1,70 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Card, Table, Tag, Typography, Spin, Empty, Statistic, Row, Col, Space } from "antd";
 import {
   MonitorOutlined, ApiOutlined, ClockCircleOutlined,
   ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined,
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
+import { getProviderColor } from "../constants/providerColors";
+import { monitorApi, type MonitorOverview, type MonitorLogItem } from "../api";
 
 const { Text, Title } = Typography;
-
-const API = "http://localhost:15722";
-
-interface LogItem {
-  id: string;
-  created_at: string;
-  prompt: string;
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  model: string;
-  provider: string;
-  route_reason: string;
-  intent_match: string;
-  intent_score: number;
-  status: string;
-  cost_usd: number;
-  latency_ms: number;
-}
-
-interface Overview {
-  total_requests: number;
-  today_requests: number;
-  error_count: number;
-  error_rate: number;
-  total_tokens: number;
-  total_cost_usd: number;
-  avg_latency_ms: number;
-  by_provider: { provider: string; requests: number; cost_usd: number }[];
-  by_model: { model: string; requests: number; cost_usd: number; avg_latency_ms: number }[];
-  by_intent: { intent: string; requests: number; cost_usd: number }[];
-}
 
 export default function MonitorPanel() {
   const { t, i18n } = useTranslation();
   const lang = i18n.language.startsWith("zh") ? "zh" : "en";
 
-  const [logs, setLogs] = useState<LogItem[]>([]);
-  const [overview, setOverview] = useState<Overview | null>(null);
+  const [logs, setLogs] = useState<MonitorLogItem[]>([]);
+  const [overview, setOverview] = useState<MonitorOverview | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const intervalRef = useRef<ReturnType<typeof setInterval>>();
 
   const fetchData = async () => {
     try {
       const [logRes, ovRes] = await Promise.all([
-        fetch(`${API}/api/monitor/recent?limit=100`).then(r => r.json()),
-        fetch(`${API}/api/monitor/overview`).then(r => r.json()),
+        monitorApi.getRecent(100),
+        monitorApi.getOverview(),
       ]);
       setLogs(logRes.items || []);
       setOverview(ovRes);
     } catch (e) {
-      console.error(e);
+      console.warn("[Monitor] 数据获取失败:", (e as Error).message);
     }
     setLoading(false);
   };
 
   useEffect(() => { fetchData(); }, []);
 
-  // Auto-refresh every 10 seconds
+  // Auto-refresh every 10 seconds, pause when page is hidden.
   useEffect(() => {
-    const interval = setInterval(fetchData, 10_000);
-    return () => clearInterval(interval);
+    const startPolling = () => {
+      if (!intervalRef.current) {
+        intervalRef.current = setInterval(fetchData, 10_000);
+      }
+    };
+    const stopPolling = () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = undefined;
+      }
+    };
+
+    startPolling();
+
+    const handleVisibility = () => {
+      if (document.hidden) {
+        stopPolling();
+      } else {
+        fetchData(); // 立即刷新
+        startPolling();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      stopPolling();
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, []);
 
   const columns = [
@@ -78,8 +75,7 @@ export default function MonitorPanel() {
     {
       title: lang === "zh" ? "供应商" : "Provider", dataIndex: "provider", width: 90,
       render: (v: string) => {
-        const colors: Record<string, string> = { DeepSeek: "blue", MiniMax: "red", Bailian: "purple", claude: "purple", deepseek: "green" };
-        return <Tag color={colors[v] || "default"} style={{ fontSize: 10 }}>{v}</Tag>;
+        return <Tag color={getProviderColor(v)} style={{ fontSize: 10 }}>{v}</Tag>;
       },
     },
     {

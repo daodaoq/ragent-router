@@ -129,19 +129,27 @@ type EmbeddingCache struct {
 	mu      sync.RWMutex
 	entries map[string]cacheEntry
 	ttl     time.Duration
+	stop    chan struct{} // 通知后台清理协程退出
 }
 
 // NewEmbeddingCache 创建一个嵌入向量缓存。
 //
 // ttl 是每条缓存记录的存活时间。推荐值：1 小时。
+// 使用完毕后应调用 Stop() 停止后台清理协程。
 func NewEmbeddingCache(ttl time.Duration) *EmbeddingCache {
 	c := &EmbeddingCache{
 		entries: make(map[string]cacheEntry),
 		ttl:     ttl,
+		stop:    make(chan struct{}),
 	}
 	// 启动后台清理协程（每 10 分钟清理过期条目）。
 	go c.evictLoop(10 * time.Minute)
 	return c
+}
+
+// Stop 停止后台清理协程。调用后缓存不可再用。
+func (c *EmbeddingCache) Stop() {
+	close(c.stop)
 }
 
 // Get 从缓存中获取嵌入向量（返回副本，修改不影响缓存内部数据）。
@@ -200,11 +208,17 @@ func (c *EmbeddingCache) Size() int {
 }
 
 // evictLoop 在后台定期清理过期条目。
+// 通过 c.stop channel 接收退出信号。
 func (c *EmbeddingCache) evictLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		c.evictExpired()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case <-ticker.C:
+			c.evictExpired()
+		}
 	}
 }
 

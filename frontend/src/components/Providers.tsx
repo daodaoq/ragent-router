@@ -6,17 +6,9 @@ import {
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import PageHelp from "./PageHelp";
+import { providersApi, type ProviderItem, type CCStatus } from "../api";
 
 const { Text, Title } = Typography;
-
-interface Endpoint { app_type: string; url: string; }
-
-interface Provider {
-  id: string; app_type: string; name: string; category: string;
-  is_current: boolean; endpoints: Endpoint[];
-  cost_multiplier: string; icon_color: string;
-  limit_daily_usd: string | null; limit_monthly_usd: string | null;
-}
 
 const CATEGORY_LABELS: Record<string, { en: string; zh: string; color: string }> = {
   official: { en: "Official", zh: "官方", color: "blue" },
@@ -31,36 +23,39 @@ const APP_TYPE_LABELS: Record<string, string> = {
 export default function Providers() {
   const { t, i18n } = useTranslation();
   const lang = i18n.language.startsWith("zh") ? "zh" : "en";
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [dbStatus, setDbStatus] = useState<{ available: boolean; path: string; db_size_mb: number } | null>(null);
+  const [dbStatus, setDbStatus] = useState<CCStatus | null>(null);
   const [activeId, setActiveId] = useState<string>("");
   const [activating, setActivating] = useState<string | null>(null);
   const fetchProviders = () => {
-    fetch("http://localhost:15722/api/ccswitch/providers")
-      .then(r => r.json())
+    providersApi.list()
       .then(data => {
-        const items = (data.items || []).filter((p: Provider) => p.name !== "default");
+        const items = (data.items || []).filter((p) => p.name !== "default");
         setProviders(items);
         // Find current provider from is_current flag
-        const current = items.find((p: Provider) => p.is_current);
+        const current = items.find((p) => p.is_current);
         if (current) setActiveId(current.id);
         setLoading(false);
-      }).catch(() => setLoading(false));
+      }).catch((err: Error) => {
+        console.warn("[Providers] 获取供应商列表失败:", err.message);
+        setLoading(false);
+      });
   };
 
   useEffect(() => {
     fetchProviders();
-    fetch("http://localhost:15722/api/ccswitch/status")
-      .then(r => r.json()).then(setDbStatus).catch(() => {});
+    providersApi.getStatus()
+      .then(setDbStatus).catch((err: Error) => {
+        console.warn("[Providers] 获取状态失败:", err.message);
+      });
   }, []);
 
-  const handleActivate = async (provider: Provider) => {
+  const handleActivate = async (provider: ProviderItem) => {
     if (provider.id === activeId) return;
     setActivating(provider.id);
     try {
-      const res = await fetch(`http://localhost:15722/api/ccswitch/activate/${provider.id}`, { method: "POST" });
-      const data = await res.json();
+      const data = await providersApi.activate(provider.id);
       if (data.success) {
         setActiveId(provider.id);
         message.success(
@@ -69,7 +64,7 @@ export default function Providers() {
             : `Switched to ${data.provider_name} — next Claude Code request uses new provider`
         );
       } else {
-        message.error(data.detail || data.message || "Failed");
+        message.error(lang === "zh" ? "切换失败" : "Activation failed");
       }
     } catch {
       message.error(lang === "zh" ? "切换失败" : "Activation failed");
@@ -152,7 +147,7 @@ export default function Providers() {
                 {/* Footer */}
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 8 }}>
                   <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    <span>{lang === "zh" ? "倍率" : "Multiplier"}: {p.cost_multiplier || "1.0"}x</span>
+                    <span>{lang === "zh" ? "倍率" : "Multiplier"}: {(p as any).cost_multiplier || "1.0"}x</span>
                   </div>
 
                   {isActive ? (

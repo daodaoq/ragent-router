@@ -26,11 +26,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ragent/router/internal/proxy"
 	"github.com/ragent/router/internal/routing"
 	"github.com/ragent/router/internal/store"
@@ -156,8 +158,8 @@ func main() {
 	// ── 请求日志回调：代理请求完成后写入 SQLite ──
 	p.OnRequestLog = func(rl proxy.RequestLog) {
 		record := &store.RequestLogRecord{
-			ID:                 fmt.Sprintf("%d", time.Now().UnixNano()),
-			Prompt:             store.CompactPrompt("", 500),
+			ID:                 uuid.NewString(),
+			Prompt:             store.CompactPrompt(rl.Prompt, 500),
 			PromptTokens:       rl.PromptTokens,
 			CompletionTokens:   rl.CompletionTokens,
 			TotalTokens:        rl.TotalTokens,
@@ -179,13 +181,54 @@ func main() {
 	// ── 构建 HTTP 路由 ──
 	mux := http.NewServeMux()
 
-	// ── 健康检查 ──
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	// ── 活跃性检查（Kubernetes liveness probe）──
+	// 仅检查进程是否存活，不做依赖检查。
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":  "ok",
 			"service": "ragent-router",
-			"version": "0.2.0",
 		})
+	})
+
+	// ── 就绪检查（Kubernetes readiness probe）──
+	// 检查 DB 连接和供应商可用性。
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		dbStatus := "ok"
+		if err := logStore.DB().Ping(); err != nil {
+			dbStatus = "error: " + err.Error()
+		}
+		providerCount := 0
+		for _, prov := range providers {
+			if prov.Enabled {
+				providerCount++
+			}
+		}
+		status := "ok"
+		if dbStatus != "ok" {
+			status = "degraded"
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":          status,
+			"service":         "ragent-router",
+			"version":         "0.2.0",
+			"database":        dbStatus,
+			"providers_count": providerCount,
+		})
+	})
+
+	// 旧版兼容：/readyz 别名
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		dbStatus := "ok"
+		if err := logStore.DB().Ping(); err != nil {
+			dbStatus = "error: " + err.Error()
+		}
+		status := http.StatusOK
+		body := map[string]interface{}{"status": "ok", "database": dbStatus}
+		if dbStatus != "ok" {
+			status = http.StatusServiceUnavailable
+			body["status"] = "not ready"
+		}
+		writeJSON(w, status, body)
 	})
 
 	// ════════════════════════════════════════════════════════════
@@ -273,14 +316,19 @@ func main() {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
+		monitor, err := logStore.MonitorOverview()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
 		byModel, _ := logStore.ByModel()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"total_requests": overview.TotalRequests,
-			"today_requests": 0,
-			"error_count":    0,
-			"total_tokens":   0,
+			"today_requests": monitor["today_requests"],
+			"error_count":    monitor["error_count"],
+			"total_tokens":   monitor["total_tokens"],
 			"total_cost_usd": overview.MonthCost,
-			"avg_latency_ms": 0,
+			"avg_latency_ms": monitor["avg_latency_ms"],
 			"by_model":       byModel,
 		})
 	})
@@ -340,22 +388,49 @@ func main() {
 		}
 	})
 
-	// 激活指定供应商。
+	// 激活指定供应商（调试锁定模式：临时绕过路由引擎，固定使用指定供应商）。
 	mux.HandleFunc("/api/proxy/activate/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "需要 POST 请求"})
-			return
-		}
 		providerID := strings.TrimPrefix(r.URL.Path, "/api/proxy/activate/")
 		if providerID == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少供应商 ID"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"success":       true,
-			"provider_name": providerID,
-			"message":       fmt.Sprintf("已切换到供应商: %s", providerID),
-		})
+
+		switch r.Method {
+		case http.MethodPost:
+			// 查找供应商名称（providerID 可能是 ID 或 Name）。
+			providerName := ""
+			for _, prov := range providers {
+				if prov.ID == providerID || prov.Name == providerID {
+					providerName = prov.Name
+					break
+				}
+			}
+			if providerName == "" {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "供应商不存在: " + providerID})
+				return
+			}
+			if ok := p.SetDebugProvider(providerName); !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "无法激活供应商: " + providerName})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success":       true,
+				"provider_name": providerName,
+				"message":       fmt.Sprintf("调试锁定模式：所有请求将路由到 %s（重启或 POST /api/proxy/activate/_clear 恢复正常路由）", providerName),
+			})
+
+		case http.MethodDelete:
+			// 清除调试锁定，恢复正常路由。
+			p.SetDebugProvider("")
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "调试锁定已清除，恢复正常路由引擎",
+			})
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "需要 POST（激活）或 DELETE（清除）请求"})
+		}
 	})
 
 	// 获取代理健康状态。
@@ -377,14 +452,20 @@ func main() {
 	// 获取所有已注册的供应商列表。
 	mux.HandleFunc("/api/ccswitch/providers", func(w http.ResponseWriter, r *http.Request) {
 		providers := p.ListProviders()
+		debugProvider := p.GetDebugProvider()
 		items := make([]map[string]interface{}, 0, len(providers))
 		for _, prov := range providers {
+			isCurrent := prov.Name == debugProvider
+			// 如果未设置调试锁定，第一个启用的供应商为当前供应商。
+			if debugProvider == "" {
+				isCurrent = len(items) == 0
+			}
 			items = append(items, map[string]interface{}{
 				"id":         prov.ID,
 				"name":       prov.Name,
 				"app_type":   "claude",
 				"category":   "custom",
-				"is_current": true,
+				"is_current": isCurrent,
 				"icon_color": "#6366f1",
 				"enabled":    prov.Enabled,
 				"endpoints":  []map[string]string{{"app_type": "claude", "url": prov.BaseURL}},
@@ -576,7 +657,8 @@ func main() {
 	addr := fmt.Sprintf(":%d", *port)
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      corsMiddleware(mux),
+		// 中间件链（从外到内）：recovery → requestID → auth → CORS
+		Handler:      recoveryMiddleware(requestIDMiddleware(authMiddleware(corsMiddleware(mux)))),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 300 * time.Second, // SSE 流式传输需要长超时
 		IdleTimeout:  120 * time.Second,
@@ -693,11 +775,84 @@ func getEnv(key, fallback string) string {
 // 中间件
 // ────────────────────────────────────────────────────────────
 
+// requestIDMiddleware 为每个请求生成唯一 ID 并写入响应头。
+// 如果客户端传了 X-Request-ID 则沿用，否则生成新的 UUID。
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			reqID = uuid.NewString()
+		}
+		w.Header().Set("X-Request-ID", reqID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// authMiddleware 可选的 API Token 认证中间件。
+// 通过 RAGENT_API_TOKEN 环境变量配置。未设置时跳过认证。
+func authMiddleware(next http.Handler) http.Handler {
+	token := os.Getenv("RAGENT_API_TOKEN")
+	if token == "" {
+		// 未配置 token，跳过认证（开发模式）。
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 健康检查端点免认证。
+		if r.URL.Path == "/health" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 检查 Authorization: Bearer <token> 头。
+		authHeader := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authHeader, "Bearer ") || strings.TrimPrefix(authHeader, "Bearer ") != token {
+			// 也检查 X-Api-Key 头（兼容 Anthropic 的认证方式）。
+			if r.Header.Get("X-Api-Key") != token {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recoveryMiddleware 捕获 handler panic，防止整个服务崩溃。
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] %v\n%s", err, debug.Stack())
+				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // corsMiddleware 添加跨域访问头并处理预检请求。
 // 允许前端 Dashboard（可能运行在不同端口）调用后端 API。
+// 生产环境应通过配置限制为已知来源。
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		// 允许本地开发来源和 Electron 的 file:// 协议。
+		allowedOrigins := map[string]bool{
+			"http://localhost:5173": true,
+			"http://localhost:15722": true,
+			"http://127.0.0.1:5173":  true,
+			"http://127.0.0.1:15722": true,
+		}
+		if origin != "" {
+			if allowedOrigins[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else {
+				// 未知来源：仍允许但记录警告（开发阶段，生产应收紧）。
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				log.Printf("[CORS] 未知来源: %s", origin)
+			}
+		} else {
+			// 无 Origin 头（如 Electron file:// 或直接 curl 调用）
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version")
 		w.Header().Set("Access-Control-Expose-Headers", "X-Ragent-Provider, X-Ragent-Model, X-Ragent-Reason")
@@ -727,7 +882,10 @@ func intentRecordsToIntents(records []store.IntentNodeRecord, providerIDToName m
 
 		var examples []string
 		if r.Examples != "" {
-			json.Unmarshal([]byte(r.Examples), &examples)
+			if err := json.Unmarshal([]byte(r.Examples), &examples); err != nil {
+				log.Printf("[意图] examples 字段解析失败 (intent=%s): %v", r.IntentCode, err)
+				examples = []string{}
+			}
 		}
 		if examples == nil {
 			examples = []string{}
@@ -767,10 +925,19 @@ func reloadIntents(is *store.IntentStore, engine *routing.HybridRouter, idToName
 }
 
 // writeJSON 以 JSON 格式写回响应。
+// 先编码到 buffer 再 WriteHeader，避免编码失败时客户端收到空 body + 200 状态码。
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("[HTTP] JSON 编码失败: %v", err)
+	if data == nil {
+		w.WriteHeader(status)
+		return
 	}
+	body, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[HTTP] JSON 编码失败: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(status)
+	w.Write(body)
 }

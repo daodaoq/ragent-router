@@ -17,12 +17,13 @@ export const useAppStore = create<AppState>((set) => ({
 
 // ── Initialize from Electron IPC ──────────────────────────────────
 
-// @ts-ignore
 const api = window.electronAPI;
 
 if (api) {
   api.getBackendStatus().then((s: BackendStatus) => {
     useAppStore.getState().setBackendStatus(s);
+  }).catch((err: Error) => {
+    console.warn("[AppStore] 获取后端状态失败:", err.message);
   });
   api.onBackendStatus((s: BackendStatus) => {
     useAppStore.getState().setBackendStatus(s);

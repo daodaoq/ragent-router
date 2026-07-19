@@ -12,13 +12,13 @@ import { useTranslation } from "react-i18next";
 import { useThemeStore } from "../stores/theme";
 import i18n from "../i18n";
 import PageHelp from "./PageHelp";
+import { setupApi, providersApi, trafficApi, type SetupStatus, type CCStatus } from "../api";
 
 const { Text, Title } = Typography;
 
-// @ts-ignore
 const api = window.electronAPI;
 
-interface CCStatus {
+interface CCStatusLocal {
   ccswitch_available: boolean;
   proxy_configured: boolean;
   current_provider: string | null;
@@ -52,7 +52,7 @@ export default function Settings() {
   const [backendOnline, setBackendOnline] = useState(false);
 
   // CC Switch
-  const [ccStatus, setCcStatus] = useState<CCStatus | null>(null);
+  const [ccStatus, setCcStatus] = useState<SetupStatus | null>(null);
   const [ccDetails, setCcDetails] = useState<CCDetails | null>(null);
   const [trafficStatus, setTrafficStatus] = useState<TrafficStatus | null>(null);
   const [reverting, setReverting] = useState(false);
@@ -79,13 +79,13 @@ export default function Settings() {
 
     // Fetch CC Switch status
     Promise.all([
-      fetch("http://localhost:15722/api/setup/status").then(r => r.json()).catch(() => null),
-      fetch("http://localhost:15722/api/ccswitch/status").then(r => r.json()).catch(() => null),
-      fetch("http://localhost:15722/api/traffic/status").then(r => r.json()).catch(() => null),
+      setupApi.getStatus().catch(() => null),
+      providersApi.getStatus().catch(() => null),
+      trafficApi.getStatus().catch(() => null),
     ]).then(([setup, details, traffic]) => {
-      setCcStatus(setup);
-      setCcDetails(details);
-      setTrafficStatus(traffic);
+      setCcStatus(setup as SetupStatus | null);
+      setCcDetails(details as CCDetails | null);
+      setTrafficStatus(traffic as TrafficStatus | null);
     });
   }, []);
 
@@ -102,13 +102,12 @@ export default function Settings() {
   const handleApplySetup = async () => {
     setApplyLoading(true);
     try {
-      const res = await fetch("http://localhost:15722/api/setup/apply", { method: "POST" });
-      const data = await res.json();
+      const data = await setupApi.apply();
       if (data.success) {
         setCcStatus(prev => prev ? { ...prev, proxy_configured: true } : null);
         message.success(lang === "zh" ? "代理已配置成功" : "Proxy configured successfully");
       } else {
-        message.error(data.detail || data.message || "Failed");
+        message.error(lang === "zh" ? "配置失败" : "Setup failed");
       }
     } catch { message.error(lang === "zh" ? "配置失败" : "Setup failed"); }
     setApplyLoading(false);
@@ -117,12 +116,11 @@ export default function Settings() {
   const handleRevert = async () => {
     setReverting(true);
     try {
-      const res = await fetch("http://localhost:15722/api/setup/revert", { method: "POST" });
-      const data = await res.json();
+      const data = await setupApi.revert();
       if (data.success) {
         setCcStatus(prev => prev ? { ...prev, proxy_configured: false } : null);
         message.success(
-          lang === "zh" ? `已恢复到 ${data.restored_provider}` : `Reverted to ${data.restored_provider}`
+          lang === "zh" ? `已恢复到 ${(data as any).restored_provider}` : `Reverted to ${(data as any).restored_provider}`
         );
       }
     } catch { message.error(lang === "zh" ? "回退失败" : "Revert failed"); }

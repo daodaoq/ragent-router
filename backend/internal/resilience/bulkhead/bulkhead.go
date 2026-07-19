@@ -50,6 +50,7 @@ func New(maxConcurrent int) *Bulkhead {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
+	// & 是取地址运算符，创建一个结构体实例并返回其指针
 	return &Bulkhead{
 		sem: make(chan struct{}, maxConcurrent),
 	}
@@ -70,6 +71,7 @@ func (b *Bulkhead) Execute(ctx context.Context, fn func() error) error {
 	case b.sem <- struct{}{}:
 		// 成功获取槽位，函数返回后释放。
 		defer func() { <-b.sem }()
+		// 执行用户函数并返回
 		return fn()
 	case <-ctx.Done():
 		return ctx.Err()

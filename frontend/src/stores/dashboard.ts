@@ -45,7 +45,7 @@ export const useDashboardStore = create<DashboardState>((set) => ({
         loading: false,
       });
     } catch (err) {
-      console.error("Failed to fetch dashboard data:", err);
+      console.warn("[Dashboard] 数据获取失败:", (err as Error).message);
       set({ loading: false });
     }
   },

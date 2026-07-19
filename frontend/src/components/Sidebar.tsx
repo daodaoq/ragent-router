@@ -6,9 +6,10 @@ import {
   BarChartOutlined,
   RobotOutlined,
   MonitorOutlined,
+  DashboardOutlined,
 } from "@ant-design/icons";
 
-type Page = "providers" | "traffic" | "settings" | "intent" | "monitor";
+type Page = "providers" | "traffic" | "settings" | "intent" | "monitor" | "dashboard";
 
 interface NavItem {
   key: Page;
@@ -20,6 +21,7 @@ export default function Sidebar({ active, onChange }: { active: Page; onChange: 
   const { t } = useTranslation();
 
   const navItems: NavItem[] = [
+    { key: "dashboard", icon: <DashboardOutlined />, labelKey: "nav.dashboard" },
     { key: "providers", icon: <ApiOutlined />, labelKey: "nav.providers" },
     { key: "traffic", icon: <BarChartOutlined />, labelKey: "nav.traffic" },
     { key: "monitor", icon: <MonitorOutlined />, labelKey: "nav.monitor" },

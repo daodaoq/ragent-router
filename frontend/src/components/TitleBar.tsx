@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "../i18n";
 
-// @ts-ignore - injected by preload
 const api = window.electronAPI;
 
 export default function TitleBar() {

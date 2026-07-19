@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-// @ts-ignore
 const api = window.electronAPI;
 
 interface Props {

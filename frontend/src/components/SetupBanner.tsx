@@ -4,22 +4,16 @@ import {
   SettingOutlined, CheckCircleOutlined, RollbackOutlined, ExclamationCircleOutlined,
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
+import { setupApi, type SetupStatus } from "../api";
 
 const { Text } = Typography;
 
 const SETUP_DONE_KEY = "ragent-setup-done";
 
-interface Status {
-  ccswitch_available: boolean;
-  proxy_configured: boolean;
-  current_provider: string | null;
-  proxy_base_url: string;
-}
-
 export default function SetupBanner() {
   const { t, i18n } = useTranslation();
   const lang = i18n.language.startsWith("zh") ? "zh" : "en";
-  const [status, setStatus] = useState<Status | null>(null);
+  const [status, setStatus] = useState<SetupStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
   const [reverting, setReverting] = useState(false);
@@ -27,8 +21,7 @@ export default function SetupBanner() {
   const [justCompleted, setJustCompleted] = useState(false);
 
   useEffect(() => {
-    fetch("http://localhost:15722/api/setup/status")
-      .then(r => r.json())
+    setupApi.getStatus()
       .then(data => {
         setStatus(data);
         setLoading(false);
@@ -37,14 +30,16 @@ export default function SetupBanner() {
           setDismissed(true);
         }
       })
-      .catch(() => setLoading(false));
+      .catch((err: Error) => {
+        console.warn("[Setup] 获取状态失败:", err.message);
+        setLoading(false);
+      });
   }, []);
 
   const handleApply = async () => {
     setApplying(true);
     try {
-      const res = await fetch("http://localhost:15722/api/setup/apply", { method: "POST" });
-      const data = await res.json();
+      const data = await setupApi.apply();
       if (data.success) {
         setJustCompleted(true);
         localStorage.setItem(SETUP_DONE_KEY, "true");
@@ -55,7 +50,7 @@ export default function SetupBanner() {
             : "Setup complete! RAgent Proxy added to CC Switch. Activate it in CC Switch to route Claude Code through RAgent Router (one-time only)."
         );
       } else {
-        message.error(data.detail || "Setup failed");
+        message.error("Setup failed");
       }
     } catch {
       message.error(lang === "zh" ? "配置失败" : "Setup failed");
@@ -66,20 +61,19 @@ export default function SetupBanner() {
   const handleRevert = async () => {
     setReverting(true);
     try {
-      const res = await fetch("http://localhost:15722/api/setup/revert", { method: "POST" });
-      const data = await res.json();
+      const data = await setupApi.revert();
       if (data.success) {
         localStorage.removeItem(SETUP_DONE_KEY);
         setJustCompleted(false);
         setDismissed(false);
-        setStatus(prev => prev ? { ...prev, proxy_configured: false, current_provider: data.restored_provider } : null);
+        setStatus(prev => prev ? { ...prev, proxy_configured: false, current_provider: (data as any).restored_provider } : null);
         message.success(
           lang === "zh"
-            ? `已恢复到 ${data.restored_provider}`
-            : `Reverted to ${data.restored_provider}`
+            ? "已恢复默认配置"
+            : "Restored default config"
         );
       } else {
-        message.error(data.detail || "Revert failed");
+        message.error("Revert failed");
       }
     } catch {
       message.error(lang === "zh" ? "回退失败" : "Revert failed");

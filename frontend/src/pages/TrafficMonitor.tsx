@@ -12,6 +12,7 @@ import {
 } from "recharts";
 import { useTranslation } from "react-i18next";
 import PageHelp from "../components/PageHelp";
+import { trafficApi } from "../api";
 
 const { Text, Title } = Typography;
 
@@ -68,7 +69,6 @@ interface LatencyItem {
   max_ms: number;
 }
 
-const API = "http://localhost:15722/api/traffic";
 const REFRESH_MS = 30_000; // 30s auto-refresh
 
 function fmt(n: number): string {
@@ -91,20 +91,20 @@ export default function TrafficMonitor() {
 
   const fetchAll = useCallback(() => {
     Promise.all([
-      fetch(`${API}/overview`).then(r => r.json()),
-      fetch(`${API}/by-model`).then(r => r.json()),
-      fetch(`${API}/recent?limit=50`).then(r => r.json()),
-      fetch(`${API}/daily-trend?days=14`).then(r => r.json()),
-      fetch(`${API}/errors?hours=24`).then(r => r.json()),
-      fetch(`${API}/latency?hours=24`).then(r => r.json()),
+      trafficApi.getOverview(),
+      trafficApi.getByModel(),
+      trafficApi.getRecent(50),
+      trafficApi.getDailyTrend(14),
+      trafficApi.getErrors(24),
+      trafficApi.getLatency(24),
     ]).then(([ov, bm, rc, tr, er, la]) => {
-      setOverview(ov);
-      setAvailable(ov.available);
-      setModels(bm.items || []);
-      setRecent(rc.items || []);
-      setTrend(tr.points || []);
-      setErrors(er);
-      setLatency((la.items || []).filter((i: LatencyItem) => i.requests > 0));
+      setOverview(ov as any);
+      setAvailable((ov as any).available);
+      setModels((bm as any).items || []);
+      setRecent((rc as any).items || []);
+      setTrend((tr as any).points || []);
+      setErrors(er as any);
+      setLatency(((la as any).items || []).filter((i: any) => i.requests > 0));
       setLoading(false);
     }).catch(() => setLoading(false));
   }, []);

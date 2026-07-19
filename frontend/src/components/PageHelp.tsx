@@ -23,7 +23,8 @@ export default function PageHelp({ page }: Props) {
       trigger="click"
       placement="bottom"
     >
-      <span
+      <button
+        aria-label={t("help.pageHelp", "页面帮助")}
         style={{
           display: "inline-flex",
           alignItems: "center",
@@ -38,6 +39,8 @@ export default function PageHelp({ page }: Props) {
           transition: "all 0.15s",
           marginLeft: 6,
           verticalAlign: "middle",
+          background: "transparent",
+          padding: 0,
         }}
         onMouseEnter={(e) => {
           e.currentTarget.style.borderColor = "var(--accent)";
@@ -45,13 +48,13 @@ export default function PageHelp({ page }: Props) {
           e.currentTarget.style.background = "var(--bg-active)";
         }}
         onMouseLeave={(e) => {
-          e.currentTarget.style.borderColor = "var(--text-muted)";
+          e.currentTarget.style.borderColor = "#d1d5db";
           e.currentTarget.style.color = "var(--text-muted)";
           e.currentTarget.style.background = "transparent";
         }}
       >
         ?
-      </span>
+      </button>
     </Popover>
   );
 }

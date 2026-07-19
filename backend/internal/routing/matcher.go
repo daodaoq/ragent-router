@@ -130,7 +130,7 @@ func (e *RuleEngine) Match(_ context.Context, prompt string, model string) *prox
 	// 寻找名称中包含该模型名的供应商。
 	if model != "" && model != "auto" {
 		for _, prov := range e.providers {
-			if prov.Enabled && strings.Contains(strings.ToLower(prov.Name), strings.ToLower(model)) {
+			if prov.Enabled && strings.Contains(strings.ToLower(model), strings.ToLower(prov.Name)) {
 				return prov
 			}
 		}
@@ -169,6 +169,7 @@ func (e *RuleEngine) ruleMatches(rule Rule, promptLower string) bool {
 // ────────────────────────────────────────────────────────────
 
 // AddRule 动态添加规则并自动按优先级重排。
+// 注意：仅用于初始化阶段，不支持与 Match 并发调用。
 func (e *RuleEngine) AddRule(rule Rule) {
 	e.rules = append(e.rules, rule)
 	sort.Slice(e.rules, func(i, j int) bool {
@@ -177,6 +178,7 @@ func (e *RuleEngine) AddRule(rule Rule) {
 }
 
 // RemoveRule 按名称删除规则。
+// 注意：仅用于初始化阶段，不支持与 Match 并发调用。
 func (e *RuleEngine) RemoveRule(name string) {
 	for i, r := range e.rules {
 		if r.Name == name {
@@ -208,25 +210,25 @@ func DefaultRules() []Rule {
 		{
 			Name:     "架构与设计",
 			Keywords: []string{"architecture", "design", "refactor", "架构", "设计", "重构", "system design", "distributed", "microservice"},
-			Provider: "claude",
+			Provider: "Claude",
 			Priority: 100,
 		},
 		{
 			Name:     "Bug 修复与调试",
 			Keywords: []string{"bug", "fix", "debug", "error", "修复", "调试", "issue", "crash", "exception"},
-			Provider: "claude",
+			Provider: "Claude",
 			Priority: 90,
 		},
 		{
 			Name:     "代码生成",
 			Keywords: []string{"generate", "create", "implement", "生成", "创建", "write code", "build a"},
-			Provider: "claude",
+			Provider: "Claude",
 			Priority: 80,
 		},
 		{
 			Name:     "复杂分析",
 			Keywords: []string{"analyze", "analysis", "review", "explain", "分析", "审查"},
-			Provider: "claude",
+			Provider: "Claude",
 			Priority: 70,
 			// 仅长提示词触发，短问题走 DeepSeek。
 			MinTokens: 300,
@@ -234,13 +236,13 @@ func DefaultRules() []Rule {
 		{
 			Name:     "简单问答",
 			Keywords: []string{"explain", "what is", "how to", "解释", "什么是", "how does", "why is"},
-			Provider: "deepseek",
+			Provider: "DeepSeek",
 			Priority: 50,
 		},
 		{
 			Name:     "文档",
 			Keywords: []string{"document", "readme", "doc", "comment", "文档", "README", "documentation"},
-			Provider: "deepseek",
+			Provider: "DeepSeek",
 			Priority: 40,
 		},
 	}

@@ -98,6 +98,16 @@ func (a *OpenAIAdapter) BuildRequest(baseURL string, headers map[string]string, 
 
 	// 翻译消息格式：Anthropic → OpenAI
 	messages := translateMessages(body)
+
+	// Anthropic top-level system → OpenAI system message
+	// Anthropic 格式：{ "system": "...", "messages": [...] }
+	// OpenAI 格式：  { "messages": [{"role": "system", "content": "..."}, ...] }
+	if sys, ok := body["system"].(string); ok && sys != "" {
+		messages = append([]map[string]interface{}{
+			{"role": "system", "content": sys},
+		}, messages...)
+	}
+
 	openaiBody := map[string]interface{}{
 		"model":       body["model"],
 		"messages":    messages,
@@ -173,12 +183,15 @@ func translateMessages(body map[string]interface{}) []map[string]interface{} {
 // AdapterFor 根据供应商名称选择适配器。
 //
 // 规则：
-//   - 名称含 "openai" 或 "deepseek" → OpenAI 适配器
-//   - 其他 → Anthropic 适配器（原生格式）
+//   - 名称含 "openai"/"deepseek"/"minimax"/"bailian" → OpenAI 适配器（Chat Completions 格式）
+//   - 其他 → Anthropic 适配器（原生 Messages API 格式）
 func AdapterFor(providerName string) ProviderAdapter {
 	lower := strings.ToLower(providerName)
-	if strings.Contains(lower, "openai") || strings.Contains(lower, "deepseek") {
-		return &OpenAIAdapter{}
+	openaiCompat := []string{"openai", "deepseek", "minimax", "bailian"}
+	for _, keyword := range openaiCompat {
+		if strings.Contains(lower, keyword) {
+			return &OpenAIAdapter{}
+		}
 	}
 	return &AnthropicAdapter{}
 }
@@ -211,6 +224,11 @@ func (f *AdapterFactory) Get(providerName string) ProviderAdapter {
 // ValidateProvider 检查供应商配置是否可用。
 // 规则：必须有 BaseURL、必须有 APIKey、不能代理到自己。
 func ValidateProvider(cfg *ProviderConfig) error {
+	return ValidateProviderWithPort(cfg, 15722)
+}
+
+// ValidateProviderWithPort 检查供应商配置是否可用（支持自定义端口）。
+func ValidateProviderWithPort(cfg *ProviderConfig, selfPort int) error {
 	if cfg.BaseURL == "" {
 		return fmt.Errorf("provider %q: base_url is required", cfg.Name)
 	}
@@ -218,8 +236,15 @@ func ValidateProvider(cfg *ProviderConfig) error {
 		return fmt.Errorf("provider %q: api_key is required", cfg.Name)
 	}
 	// 防止循环代理（代理到自己的端口）
-	if cfg.BaseURL == "http://localhost:15722" || strings.Contains(cfg.BaseURL, "127.0.0.1:15722") {
-		return fmt.Errorf("provider %q: cannot proxy to self", cfg.Name)
+	selfURLs := []string{
+		fmt.Sprintf("http://localhost:%d", selfPort),
+		fmt.Sprintf("http://127.0.0.1:%d", selfPort),
+		fmt.Sprintf("http://[::1]:%d", selfPort),
+	}
+	for _, selfURL := range selfURLs {
+		if strings.Contains(cfg.BaseURL, selfURL) {
+			return fmt.Errorf("provider %q: cannot proxy to self (%s)", cfg.Name, selfURL)
+		}
 	}
 	return nil
 }

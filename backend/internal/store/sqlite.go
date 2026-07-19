@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	// modernc.org/sqlite 是纯 Go 实现的 SQLite 驱动，无需 CGO。
 	// 选择原因：零 C 依赖，跨平台编译无痛，适合本地嵌入式数据库场景。
@@ -39,9 +40,10 @@ func NewLogStore(path string) (*LogStore, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	// SQLite 单写者——限制连接数避免 SQLITE_BUSY。
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// WAL 模式下允许多个读连接并发，1 个写连接即可。
+	// 开 4 个连接允许 Dashboard 查询与日志写入并行。
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
 
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -126,10 +128,24 @@ func (s *LogStore) DashboardOverview() (*DashboardOverview, error) {
 		return nil, fmt.Errorf("total requests: %w", err)
 	}
 
-	// 节省估算：假设路由到低价模型节省了约 25% 的费用。
-	// 注：这只是一个近似值，精确计算需要对比"全部用 Claude"和"路由后"的费用差。
-	overview.SavedAmount = overview.MonthCost * 0.25
-	overview.SavingRate = 25.0
+	// 节省估算：对比"全部走 Claude"与"实际混合路由"的费用差。
+	// 本月如果全部请求走 Claude 的费用 ≈ 总Token数 × Claude 费率。
+	var totalPrompt, totalCompletion int64
+	s.db.QueryRow(
+		"SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0) FROM request_logs WHERE created_at >= ?",
+		monthStart,
+	).Scan(&totalPrompt, &totalCompletion)
+	// Claude 费率: $3.00/M input, $15.00/M output
+	estimatedClaudeCost := (float64(totalPrompt)*3.00 + float64(totalCompletion)*15.00) / 1_000_000
+	overview.SavedAmount = estimatedClaudeCost - overview.MonthCost
+	if overview.SavedAmount < 0 {
+		overview.SavedAmount = 0
+	}
+	if estimatedClaudeCost > 0 {
+		overview.SavingRate = float64(int(overview.SavedAmount/estimatedClaudeCost*1000)) / 10 // 保留1位小数
+	} else {
+		overview.SavingRate = 0
+	}
 
 	return &overview, nil
 }
@@ -204,9 +220,10 @@ func (s *LogStore) RecentRoutes(limit int) ([]RecentRoute, error) {
 			&r.RouteReason, &r.CostUSD, &r.LatencyMs, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan route: %w", err)
 		}
-		// 提示词截断到 200 字符用于展示。
-		if len(r.Prompt) > 200 {
-			r.Prompt = r.Prompt[:200]
+		// 提示词按 rune 截断到 200 字符用于展示（避免中文乱码）。
+		if utf8.RuneCountInString(r.Prompt) > 200 {
+			runes := []rune(r.Prompt)
+			r.Prompt = string(runes[:200])
 		}
 		r.CreatedAt = createdAt.Format("2006-01-02 15:04:05")
 		result = append(result, r)
@@ -243,6 +260,50 @@ func (s *LogStore) CostTrend(days int) ([]CostTrendPoint, error) {
 		result = append(result, p)
 	}
 	return result, nil
+}
+
+// MonitorOverview 返回监控页面的聚合数据（今日实时统计）。
+func (s *LogStore) MonitorOverview() (map[string]interface{}, error) {
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	var todayRequests, errorCount, totalTokens int64
+	var avgLatencyMs float64
+
+	// 今日请求总数
+	if err := s.db.QueryRow(
+		"SELECT COUNT(1) FROM request_logs WHERE created_at >= ?", todayStart,
+	).Scan(&todayRequests); err != nil {
+		return nil, fmt.Errorf("today requests: %w", err)
+	}
+
+	// 今日错误数
+	if err := s.db.QueryRow(
+		"SELECT COUNT(1) FROM request_logs WHERE created_at >= ? AND status = 'error'", todayStart,
+	).Scan(&errorCount); err != nil {
+		return nil, fmt.Errorf("error count: %w", err)
+	}
+
+	// 今日总 Token 数
+	if err := s.db.QueryRow(
+		"SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at >= ?", todayStart,
+	).Scan(&totalTokens); err != nil {
+		return nil, fmt.Errorf("total tokens: %w", err)
+	}
+
+	// 今日平均延迟
+	if err := s.db.QueryRow(
+		"SELECT COALESCE(AVG(latency_ms), 0) FROM request_logs WHERE created_at >= ?", todayStart,
+	).Scan(&avgLatencyMs); err != nil {
+		return nil, fmt.Errorf("avg latency: %w", err)
+	}
+
+	return map[string]interface{}{
+		"today_requests": todayRequests,
+		"error_count":    errorCount,
+		"total_tokens":   totalTokens,
+		"avg_latency_ms": int(avgLatencyMs),
+	}, nil
 }
 
 // ByModel 返回各模型的详细统计（按请求次数降序）。
@@ -340,10 +401,15 @@ func migrate(db *sql.DB) error {
 }
 
 // CompactPrompt 截断提示词用于展示。
-// 保留前 maxLen 个字符，超出部分用 "..." 替代。
+// 保留前 maxLen 个字符（按 rune 而非 byte 计数），超出部分用 "..." 替代。
+// 避免中文字符（3 字节/字符）在字节边界被截断产生乱码。
 func CompactPrompt(prompt string, maxLen int) string {
-	if len(prompt) <= maxLen {
+	if utf8.RuneCountInString(prompt) <= maxLen {
 		return prompt
 	}
-	return strings.TrimSpace(prompt[:maxLen]) + "..."
+	runes := []rune(prompt)
+	if len(runes) <= maxLen {
+		return prompt
+	}
+	return strings.TrimSpace(string(runes[:maxLen])) + "..."
 }

@@ -90,7 +90,7 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 
 	// Check if breaker opened.
 	if s := cb.State(); s != circuitbreaker.StateOpen {
-		t.Logf("  State after failures: %s (may need more failures to trip)", s)
+		t.Fatalf("  Expected StateOpen after failures, got %s (failure threshold may need tuning)", s)
 	} else {
 		t.Log("  State: Open ✓ (breaker tripped)")
 	}

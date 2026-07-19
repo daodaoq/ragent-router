@@ -4,18 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ragent/router/internal/resilience/bulkhead"
 	"github.com/ragent/router/internal/resilience/circuitbreaker"
 	"github.com/ragent/router/internal/resilience/ratelimit"
 	"github.com/ragent/router/internal/resilience/retry"
 	"github.com/ragent/router/internal/resilience/timeout"
 )
+
+// ErrStreamStarted 表示 SSE 流式传输已开始（WriteHeader 已调用），不可重试。
+// 上游网络抖动导致 io.Copy 中途失败时，不能重新发起请求，
+// 否则会重复写响应头并产生混乱的 SSE 数据。
+var ErrStreamStarted = errors.New("stream already started, cannot retry")
 
 // ────────────────────────────────────────────────────────────
 // Proxy 核心结构
@@ -64,6 +72,9 @@ type Proxy struct {
 
 	// 请求日志回调——每次请求完成后调用
 	OnRequestLog func(log RequestLog)
+
+	// 调试锁定：非空时强制路由到指定供应商（绕过路由引擎）。
+	debugProvider string
 }
 
 // RouteMatcher 是路由选择的接口。
@@ -76,6 +87,7 @@ type RouteMatcher interface {
 // RequestLog 是一次代理请求完成后的日志记录。
 type RequestLog struct {
 	RequestID        string
+	Prompt           string // 用户提示词（截断后）
 	Provider         string
 	Model            string
 	RouteReason      string
@@ -211,7 +223,17 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 	prompt := extractPrompt(bodyJSON)
 	modelName, _ := bodyJSON["model"].(string)
 
-	provider := p.matcher.Match(r.Context(), prompt, modelName)
+	// 调试锁定：如果设置了 debugProvider，直接使用（绕过路由引擎）。
+	var provider *ProviderConfig
+	if p.debugProvider != "" {
+		if pv, ok := p.providers[p.debugProvider]; ok && pv.Enabled {
+			provider = pv
+			log.Printf("[路由] 调试锁定 → %s (绕过路由引擎)", provider.Name)
+		}
+	}
+	if provider == nil {
+		provider = p.matcher.Match(r.Context(), prompt, modelName)
+	}
 	if provider == nil {
 		// 降级：取第一个启用的供应商
 		for _, pv := range p.providers {
@@ -235,39 +257,37 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 
 	// ── 步骤 4：初始化追踪 ──
 	tracking := &RequestTracking{
-		RequestID: fmt.Sprintf("%d", time.Now().UnixNano()),
+		RequestID: uuid.NewString(),
 	}
 
 	// ── 步骤 5：韧性保护 + 上游转发 ──
-	// 执行顺序：熔断器.Call → 重试.Do → 实际请求
-	// 注意：重试次数设为 2（共 3 次尝试：1 初始 + 2 重试）
-	retryCfg := retry.DefaultConfig()
-	retryCfg.MaxAttempts = 2
-	backoff := retry.NewExponentialBackoff(retryCfg)
-
-	var proxyErr error
+	// 注意：SSE 流式传输一旦开始（WriteHeader 后）就无法重试。
+	// 重试仅在 doUpstreamRequest 内部的连接建立阶段（WriteHeader 之前）。
 	err = breaker.Call(func() error {
-		return retry.Do(r.Context(), backoff, backoff.MaxAttempts(), func() error {
-			return p.doUpstreamRequest(w, r, provider, bodyJSON, tracking)
-		})
+		return p.doUpstreamRequest(w, r, provider, bodyJSON, tracking)
 	})
+
+	// 流式传输已开始的错误：无法重试，但属于预期内的中断，记录即可。
+	if errors.Is(err, ErrStreamStarted) {
+		log.Printf("[流式传输] SSE 传输中断（流已开始，无法重试）: %v", err)
+	}
 
 	// ── 步骤 6：记录日志 ──
 	latency := time.Since(startTime).Milliseconds()
 	status := "ok"
 	errorDetail := ""
-	if proxyErr != nil || err != nil {
+	if err != nil {
 		status = "error"
-		if proxyErr != nil {
-			errorDetail = proxyErr.Error()
-		} else if err != nil {
-			errorDetail = err.Error()
+		errorDetail = err.Error()
+		if errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+			errorDetail = "熔断器已打开: " + errorDetail
 		}
 	}
 
 	if p.OnRequestLog != nil {
 		p.OnRequestLog(RequestLog{
 			RequestID:        tracking.RequestID,
+			Prompt:           prompt,
 			Provider:         provider.Name,
 			Model:            modelName,
 			RouteReason:      fmt.Sprintf("prompt_len=%d", len(prompt)),
@@ -292,12 +312,12 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 
 // doUpstreamRequest 向供应商发送 HTTP 请求并以 SSE 流式传回。
 //
-// 流程：
-//  1. 通过适配器构建供应商原生格式的请求
-//  2. 创建 HTTP 请求（带级联超时）
-//  3. 发送请求，检查响应状态
-//  4. 设置 SSE 响应头
-//  5. 通过 TokenTracker 流式复制响应（同时提取 Token 用量）
+// 流程分为两个阶段：
+//  1. 可重试阶段：构建请求 → 发送请求 → 检查响应状态（WriteHeader 之前）
+//  2. 不可重试阶段：设置 SSE 响应头 → 流式复制（WriteHeader 之后）
+//
+// 连接阶段的错误可以重试（网络抖动、DNS 解析失败、上游 5xx 等），
+// 但 WriteHeader 之后的 io.Copy 错误不能重试（会重复写响应头）。
 func (p *Proxy) doUpstreamRequest(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -305,7 +325,8 @@ func (p *Proxy) doUpstreamRequest(
 	body map[string]interface{},
 	tracking *RequestTracking,
 ) error {
-	// ── 构建供应商原生请求 ──
+	// ── 阶段 1：可重试的连接建立 ──
+	// 使用重试机制处理网络抖动和上游临时故障。
 	adapter := p.adapters.Get(provider.Name)
 
 	headers := map[string]string{
@@ -322,29 +343,46 @@ func (p *Proxy) doUpstreamRequest(
 		return fmt.Errorf("build request: %w", err)
 	}
 
-	// ── 创建上游请求（级联超时）──
-	// 总超时 120s，但如果 ctx 有更紧的 deadline 则受 ctx 约束。
-	upstreamCtx, cancel := timeout.Cascading(r.Context(), 120*time.Second)
-	defer cancel()
+	// 可重试：发送上游请求 + 检查响应状态。
+	retryCfg := retry.DefaultConfig()
+	retryCfg.MaxAttempts = 2
+	backoff := retry.NewExponentialBackoff(retryCfg)
 
-	bodyReader := bytes.NewReader(reqBody)
-	upstreamReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, url, bodyReader)
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	for k, v := range reqHeaders {
-		upstreamReq.Header.Set(k, v)
-	}
-	upstreamReq.ContentLength = int64(len(reqBody))
+	var resp *http.Response
+	err = retry.Do(r.Context(), backoff, backoff.MaxAttempts(), func() error {
+		upstreamCtx, cancel := timeout.Cascading(r.Context(), 120*time.Second)
+		defer cancel()
 
-	// ── 发送上游请求 ──
-	resp, err := p.client.Do(upstreamReq)
+		bodyReader := bytes.NewReader(reqBody)
+		upstreamReq, reqErr := http.NewRequestWithContext(upstreamCtx, http.MethodPost, url, bodyReader)
+		if reqErr != nil {
+			return fmt.Errorf("create request: %w", reqErr)
+		}
+		for k, v := range reqHeaders {
+			upstreamReq.Header.Set(k, v)
+		}
+		upstreamReq.ContentLength = int64(len(reqBody))
+
+		resp2, doErr := p.client.Do(upstreamReq)
+		if doErr != nil {
+			return fmt.Errorf("upstream request: %w", doErr)
+		}
+
+		if resp2.StatusCode >= 500 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp2.Body, 4096))
+			resp2.Body.Close()
+			return fmt.Errorf("upstream HTTP %d (retryable): %s", resp2.StatusCode, string(errBody))
+		}
+
+		resp = resp2
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("upstream request: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 
-	// 上游返回错误 → 记录错误信息并返回。
+	// 上游返回 4xx 错误（不可重试，是客户端问题）。
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, string(errBody))
@@ -367,7 +405,7 @@ func (p *Proxy) doUpstreamRequest(
 	tracker := NewTokenTracker(w, tracking)
 	_, err = io.Copy(tracker, resp.Body)
 	if err != nil {
-		return fmt.Errorf("stream copy: %w", err)
+		return fmt.Errorf("%w: stream copy: %w", ErrStreamStarted, err)
 	}
 	flusher.Flush()
 
@@ -427,14 +465,7 @@ func extractPrompt(body map[string]interface{}) string {
 }
 
 func joinStrings(parts []string, sep string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	result := parts[0]
-	for i := 1; i < len(parts); i++ {
-		result += sep + parts[i]
-	}
-	return result
+	return strings.Join(parts, sep)
 }
 
 // ────────────────────────────────────────────────────────────
@@ -461,7 +492,7 @@ func estimateCost(provider, model string, inputTokens, outputTokens int) float64
 	}
 
 	for keyword, r := range rates {
-		if contains(provider, keyword) || contains(model, keyword) {
+		if strings.Contains(provider, keyword) || strings.Contains(model, keyword) {
 			cost := (float64(inputTokens)*r.input + float64(outputTokens)*r.output) / 1_000_000
 			return float64(int(cost*10000)) / 10000 // 保留 4 位小数
 		}
@@ -469,24 +500,12 @@ func estimateCost(provider, model string, inputTokens, outputTokens int) float64
 	return 0.0
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // ────────────────────────────────────────────────────────────
 // 供应商管理（运行时动态修改）
 // ────────────────────────────────────────────────────────────
 
 // AddProvider 运行时注册新供应商，同时创建对应的熔断器。
+// 注意：此方法主要用于初始化阶段。运行时调用需自行确保不与 Match 并发调用。
 func (p *Proxy) AddProvider(cfg ProviderConfig) {
 	cfg.Enabled = true
 	p.providers[cfg.Name] = &cfg
@@ -495,6 +514,7 @@ func (p *Proxy) AddProvider(cfg ProviderConfig) {
 }
 
 // RemoveProvider 移除供应商及其熔断器。
+// 注意：此方法主要用于初始化阶段。运行时调用需自行确保不与 Match 并发调用。
 func (p *Proxy) RemoveProvider(name string) {
 	delete(p.providers, name)
 	delete(p.breakers, name)
@@ -512,6 +532,25 @@ func (p *Proxy) ListProviders() []*ProviderConfig {
 		result = append(result, pv)
 	}
 	return result
+}
+
+// SetDebugProvider 设置为调试锁定模式——所有请求强制路由到指定供应商。
+// 传入空字符串清除锁定，恢复正常路由。
+func (p *Proxy) SetDebugProvider(name string) bool {
+	if name == "" {
+		p.debugProvider = ""
+		return true
+	}
+	if _, ok := p.providers[name]; ok {
+		p.debugProvider = name
+		return true
+	}
+	return false
+}
+
+// GetDebugProvider 返回当前调试锁定的供应商名（空=未锁定）。
+func (p *Proxy) GetDebugProvider() string {
+	return p.debugProvider
 }
 
 // BreakerStats 返回指定供应商的熔断器状态。

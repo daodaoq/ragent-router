@@ -229,8 +229,10 @@ func (r *HybridRouter) ReloadIntents(ctx context.Context, intents []Intent) erro
 	r.classifyIntents = intents
 	r.intentMu.Unlock()
 
-	// 清空 Prompt 缓存（旧意图的嵌入向量可能已失效）。
+	// 停止旧缓存的后台协程，创建新缓存。
+	oldCache := r.cache
 	r.cache = NewEmbeddingCache(1 * time.Hour)
+	oldCache.Stop()
 
 	log.Printf("[路由] 意图热重载完成: %d 个叶子节点", len(newEmbs))
 	return nil
@@ -273,7 +275,11 @@ func (r *HybridRouter) Match(ctx context.Context, prompt string, model string) *
 	// ════════════════════════════════════════════════════════════
 	// 策略 2：Embedding 语义匹配（~300ms，1 次 Embedding API 调用）
 	// ════════════════════════════════════════════════════════════
-	if r.embeddingSvc != nil && len(r.intents) > 0 {
+	r.intentMu.RLock()
+	hasIntents := len(r.intents) > 0
+	hasEmbeddingSvc := r.embeddingSvc != nil
+	r.intentMu.RUnlock()
+	if hasEmbeddingSvc && hasIntents {
 		if prov := r.semanticMatch(ctx, prompt); prov != nil {
 			atomic.AddInt64(&r.embeddingHits, 1)
 			return prov

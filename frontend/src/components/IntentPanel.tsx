@@ -9,44 +9,24 @@ import {
   ReloadOutlined, BulbOutlined,
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
+import {
+  providersApi, intentApi, proxyApi,
+  type ProviderItem, type IntentNode, type IntentTreeResponse,
+  type ClassifierConfig, type DefaultProvider, type ClassifyResult,
+} from "../api";
 
 const { Text, Title } = Typography;
 const { TextArea } = Input;
-
-interface Provider { id: string; name: string; }
-interface IntentNode {
-  id: string; intent_code: string; parent_code?: string | null;
-  name: string; description: string; level: number;
-  examples: string[]; provider_id?: string | null; enabled: boolean;
-  children?: IntentNode[];
-}
-interface Candidate {
-  intent_code: string; name: string; description: string;
-  score: number; reason: string;
-  provider_id?: string | null; provider_name?: string | null;
-}
-interface ClassifyResult {
-  question: string; candidates: Candidate[];
-  top: Candidate[]; matched: Candidate | null;
-  default_provider?: { found: boolean; id?: string; name?: string };
-  switched?: { success: boolean; provider_name?: string; detail?: string; fallback?: boolean };
-}
-
-const API = "http://localhost:15722";
 
 export default function IntentPanel() {
   const { t, i18n } = useTranslation();
   const lang = i18n.language.startsWith("zh") ? "zh" : "en";
 
-  const [providers, setProviders] = useState<Provider[]>([]);
+  const [providers, setProviders] = useState<ProviderItem[]>([]);
   const [tree, setTree] = useState<IntentNode[]>([]);
   const [loading, setLoading] = useState(true);
-  const [classifier, setClassifier] = useState<{
-    configured: boolean; provider_name?: string; model?: string; source?: string; message?: string;
-  } | null>(null);
-  const [defaultProvider, setDefaultProvider] = useState<{
-    found: boolean; id?: string; name?: string; message?: string;
-  } | null>(null);
+  const [classifier, setClassifier] = useState<ClassifierConfig | null>(null);
+  const [defaultProvider, setDefaultProvider] = useState<DefaultProvider | null>(null);
 
   const [question, setQuestion] = useState("");
   const [classifying, setClassifying] = useState(false);
@@ -60,17 +40,17 @@ export default function IntentPanel() {
     setLoading(true);
     try {
       const [provRes, treeRes, classRes, defRes] = await Promise.all([
-        fetch(`${API}/api/ccswitch/providers`).then(r => r.json()),
-        fetch(`${API}/api/intent/tree`).then(r => r.json()),
-        fetch(`${API}/api/intent/classifier`).then(r => r.json()),
-        fetch(`${API}/api/intent/default-provider`).then(r => r.json()),
+        providersApi.list(),
+        intentApi.getTree(),
+        intentApi.getClassifier(),
+        intentApi.getDefaultProvider(),
       ]);
-      setProviders((provRes.items || []).filter((p: Provider) => p.name !== "default"));
+      setProviders((provRes.items || []).filter((p) => p.name !== "default"));
       setTree(treeRes.roots || []);
       setClassifier(classRes);
       setDefaultProvider(defRes);
     } catch (e) {
-      console.error(e);
+      console.warn("[Intent] 数据获取失败:", (e as Error).message);
     }
     setLoading(false);
   };
@@ -82,13 +62,7 @@ export default function IntentPanel() {
     setClassifying(true);
     setResult(null);
     try {
-      const r = await fetch(`${API}/api/intent/classify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: question.trim(), auto_switch: autoSwitch }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.detail || "Classification failed");
+      const data = await intentApi.classify(question.trim(), autoSwitch);
       setResult(data);
       if (data.switched?.success) {
         if (data.switched.fallback) {
@@ -125,12 +99,11 @@ export default function IntentPanel() {
 
   const handleSwitch = async (providerId: string) => {
     try {
-      const r = await fetch(`${API}/api/ccswitch/activate/${providerId}`, { method: "POST" });
-      const data = await r.json();
+      const data = await proxyApi.activate(providerId);
       if (data.success) {
         message.success(lang === "zh" ? `已切换到 ${data.provider_name}` : `Switched to ${data.provider_name}`);
       } else {
-        message.error(data.detail || "Failed");
+        message.error("Failed");
       }
     } catch {
       message.error("Network error");
@@ -144,11 +117,11 @@ export default function IntentPanel() {
       okType: "danger",
       cancelText: lang === "zh" ? "取消" : "Cancel",
       onOk: async () => {
-        const r = await fetch(`${API}/api/intent/nodes/${intentCode}`, { method: "DELETE" });
-        if (r.ok) {
+        try {
+          await intentApi.deleteNode(intentCode);
           message.success(lang === "zh" ? "已删除" : "Deleted");
           refresh();
-        } else {
+        } catch {
           message.error("Delete failed");
         }
       },
@@ -467,7 +440,7 @@ function flatten(nodes: IntentNode[]): IntentNode[] {
 function NodeEditModal({
   visible, node, providers, allNodes, parentCode, initialLevel, onClose, onSaved,
 }: {
-  visible: boolean; node: IntentNode | null; providers: Provider[];
+  visible: boolean; node: IntentNode | null; providers: ProviderItem[];
   allNodes: IntentNode[]; parentCode?: string; initialLevel?: number;
   onClose: () => void; onSaved: () => void;
 }) {
@@ -496,31 +469,19 @@ function NodeEditModal({
 
   const handleSubmit = async () => {
     const v = await form.validateFields();
-    const payload = {
-      ...v,
-      examples: (v.examples || "").split("\n").map((s: string) => s.trim()).filter(Boolean),
-    };
-    let r;
-    if (node) {
-      r = await fetch(`${API}/api/intent/nodes/${node.intent_code}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    } else {
-      r = await fetch(`${API}/api/intent/nodes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    }
-    if (r.ok) {
+    const examples = (v.examples || "").split("\n").map((s: string) => s.trim()).filter(Boolean);
+    const payload = { ...v, examples: JSON.stringify(examples) };
+    try {
+      if (node) {
+        await intentApi.updateNode(node.intent_code, payload);
+      } else {
+        await intentApi.createNode(payload as any);
+      }
       message.success(lang === "zh" ? "已保存" : "Saved");
       onSaved();
       onClose();
-    } else {
-      const err = await r.json().catch(() => ({ detail: "Save failed" }));
-      message.error(err.detail || "Save failed");
+    } catch {
+      message.error("Save failed");
     }
   };
 

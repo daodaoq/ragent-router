@@ -58,21 +58,30 @@ type RequestTracking struct {
 // TokenTracker 包装了一个 io.Writer（实际就是 HTTP ResponseWriter）。
 // 所有数据正常透传给底层 Writer，同时按行扫描 SSE 事件。
 // 这种"拦截 + 透传"的方式对下游完全透明。
+//
+// # 跨 chunk 解析
+//
+// bufio.Scanner 在 TokenTracker 生命周期内复用，配合 bytes.Buffer 缓冲
+// 不完整的行，解决 SSE 事件被 TCP chunk 边界切断的问题。
 type TokenTracker struct {
-	writer io.Writer         // 底层 Writer（HTTP ResponseWriter）
-	track  *RequestTracking  // 收集到的元数据（修改此对象）
-	mu     sync.Mutex        // 保护 track 的并发写入
-	buf    bytes.Buffer      // 内部缓冲区（当前未使用，预留）
+	writer  io.Writer         // 底层 Writer（HTTP ResponseWriter）
+	track   *RequestTracking  // 收集到的元数据（修改此对象）
+	mu      sync.Mutex        // 保护 track 的并发写入
+	buf     bytes.Buffer      // 跨 chunk 缓冲（保存上次未完成的行）
+	scanner *bufio.Scanner    // 跨 chunk 复用的扫描器
 }
 
 // NewTokenTracker 创建解析器。
 // w 是数据实际写入的目标（通常是 HTTP ResponseWriter），
 // track 中的字段会在流式传输过程中被逐步填充。
 func NewTokenTracker(w io.Writer, track *RequestTracking) *TokenTracker {
-	return &TokenTracker{
+	t := &TokenTracker{
 		writer: w,
 		track:  track,
 	}
+	t.scanner = bufio.NewScanner(&t.buf)
+	t.scanner.Buffer(make([]byte, 64*1024), 64*1024)
+	return t
 }
 
 // Write 实现 io.Writer。
@@ -98,22 +107,20 @@ func (t *TokenTracker) Write(p []byte) (int, error) {
 //	data: <JSON payload>\n
 //	\n                        ← 空行表示事件结束
 //
-// 注意：一个 TCP chunk 可能包含多个 SSE 事件，
-// 也可能包含不完整的事件（被 buffer 边界切断）。
-// 当前实现简单处理——按行扫描，不处理跨 chunk 的事件。
-// 生产环境中应使用 bufio.Scanner + 跨 chunk 缓存。
+// 跨 chunk 处理：上一个 chunk 末尾的不完整行会被保留在 t.buf 中，
+// 与当前 chunk 拼接后再扫描，解决 TCP 分包切断 SSE 事件的问题。
 func (t *TokenTracker) scanForUsage(chunk []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	scanner := bufio.NewScanner(bytes.NewReader(chunk))
-	scanner.Buffer(make([]byte, 64*1024), 64*1024) // 最大 64KB 的行
+	// 将当前 chunk 追加到跨 chunk 缓冲区。
+	t.buf.Write(chunk)
 
 	var currentEvent string
 	var dataLines []string
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for t.scanner.Scan() {
+		line := t.scanner.Text()
 
 		if strings.HasPrefix(line, "event: ") {
 			currentEvent = strings.TrimPrefix(line, "event: ")
@@ -127,7 +134,29 @@ func (t *TokenTracker) scanForUsage(chunk []byte) {
 		}
 	}
 
-	// 处理 chunk 末尾可能在 data 后面没有空行的情况。
+	// scanner.Scan() 失败时，缓冲区中剩余的数据是不完整的行
+	// → 保留在 t.buf 中等待下一个 chunk。
+	// 重置 buffer：保留未处理完的数据 + 清空已消费的数据。
+	// 注意：bufio.Scanner 在 Scan() 返回 false 后，buffer 中
+	// 保留的是未完成的行，需要保留这些数据。
+	if t.scanner.Err() != nil {
+		// Scanner buffer 太小或其他错误 → 清空缓冲区避免数据错位。
+		t.buf.Reset()
+	} else {
+		// 正常情况：scanner 消费了所有完整行。
+		// 将 buffer 中的数据替换为剩余未扫描的数据。
+		// 由于 bufio.Scanner 已经读走了完整行，buf 中剩余的是不完整行。
+		remaining := t.buf.Bytes()
+		if len(remaining) > 0 {
+			newBuf := bytes.NewBuffer(make([]byte, 0, len(remaining)+4096))
+			newBuf.Write(remaining)
+			t.buf = *newBuf
+			t.scanner = bufio.NewScanner(&t.buf)
+			t.scanner.Buffer(make([]byte, 64*1024), 64*1024)
+		}
+	}
+
+	// 处理可能在 data 后面没有空行的情况。
 	if len(dataLines) > 0 {
 		t.processEvent(currentEvent, strings.Join(dataLines, ""))
 	}
@@ -183,6 +212,10 @@ func (t *TokenTracker) processEvent(eventType string, data string) {
 // （message_start.usage, message_delta.usage, message.usage）。
 // 使用 max() 取最大值——因为同一个请求的 usage
 // 可能跨多个 chunk 逐步更新。
+//
+// 兼容两种字段名：
+//   - Anthropic: input_tokens / output_tokens
+//   - OpenAI:    prompt_tokens / completion_tokens / total_tokens
 func (t *TokenTracker) extractUsage(payload map[string]interface{}) {
 	raw, ok := payload["usage"]
 	if !ok {
@@ -193,13 +226,25 @@ func (t *TokenTracker) extractUsage(payload map[string]interface{}) {
 		return
 	}
 
-	// 逐个提取并用 max() 防止后续事件中的低值覆盖高值。
+	// 输入 Token：优先 Anthropic 的 input_tokens，回退到 OpenAI 的 prompt_tokens
+	inputTokens := 0
 	if v, ok := usage["input_tokens"].(float64); ok {
-		t.track.Usage.InputTokens = max(t.track.Usage.InputTokens, int(v))
+		inputTokens = int(v)
+	} else if v, ok := usage["prompt_tokens"].(float64); ok {
+		inputTokens = int(v)
 	}
+	t.track.Usage.InputTokens = max(t.track.Usage.InputTokens, inputTokens)
+
+	// 输出 Token：优先 Anthropic 的 output_tokens，回退到 OpenAI 的 completion_tokens
+	outputTokens := 0
 	if v, ok := usage["output_tokens"].(float64); ok {
-		t.track.Usage.OutputTokens = max(t.track.Usage.OutputTokens, int(v))
+		outputTokens = int(v)
+	} else if v, ok := usage["completion_tokens"].(float64); ok {
+		outputTokens = int(v)
 	}
+	t.track.Usage.OutputTokens = max(t.track.Usage.OutputTokens, outputTokens)
+
+	// 缓存相关 Token（仅 Anthropic 支持）
 	if v, ok := usage["cache_read_input_tokens"].(float64); ok {
 		t.track.Usage.CacheReadTokens = max(t.track.Usage.CacheReadTokens, int(v))
 	}
@@ -207,6 +252,15 @@ func (t *TokenTracker) extractUsage(payload map[string]interface{}) {
 		t.track.Usage.CacheCreationTokens = max(t.track.Usage.CacheCreationTokens, int(v))
 	}
 
-	// 总 Token = 输入 + 输出（不含缓存 Token）
-	t.track.Usage.TotalTokens = t.track.Usage.InputTokens + t.track.Usage.OutputTokens
+	// OpenAI 的 total_tokens（如果直接提供了）
+	if t.track.Usage.TotalTokens == 0 {
+		if v, ok := usage["total_tokens"].(float64); ok {
+			t.track.Usage.TotalTokens = int(v)
+		}
+	}
+
+	// 如果 total_tokens 未直接提供，用 input+output 计算
+	if t.track.Usage.TotalTokens == 0 {
+		t.track.Usage.TotalTokens = t.track.Usage.InputTokens + t.track.Usage.OutputTokens
+	}
 }

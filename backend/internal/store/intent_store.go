@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -232,20 +233,27 @@ func (s *IntentStore) Update(code string, r *IntentNodeRecord) error {
 	return nil
 }
 
-// Delete 删除节点及其所有子节点（级联删除）。
+// Delete 删除节点及其所有子节点（级联删除，事务保护）。
 func (s *IntentStore) Delete(code string) error {
 	// 先递归收集所有需要删除的节点 code。
 	codes, err := s.collectSubtreeCodes(code)
 	if err != nil {
 		return err
 	}
-	// 批量删除。
+
+	// 在事务中批量删除，中间失败自动回滚。
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	for _, c := range codes {
-		if _, err := s.db.Exec("DELETE FROM intent_nodes WHERE intent_code = ?", c); err != nil {
+		if _, err := tx.Exec("DELETE FROM intent_nodes WHERE intent_code = ?", c); err != nil {
 			return fmt.Errorf("delete intent %s: %w", c, err)
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // collectSubtreeCodes 收集指定节点及其所有后代节点的 intent_code。
@@ -411,9 +419,14 @@ func migrateIntents(db *sql.DB) error {
 // ────────────────────────────────────────────────────────────
 
 // compactPrompt 截断提示词用于展示（与 sqlite.go 中的 CompactPrompt 保持一致）。
+// 按 rune 计数避免中文截断乱码。
 func compactPrompt(prompt string, maxLen int) string {
-	if len(prompt) <= maxLen {
+	if utf8.RuneCountInString(prompt) <= maxLen {
 		return prompt
 	}
-	return strings.TrimSpace(prompt[:maxLen]) + "..."
+	runes := []rune(prompt)
+	if len(runes) <= maxLen {
+		return prompt
+	}
+	return strings.TrimSpace(string(runes[:maxLen])) + "..."
 }
