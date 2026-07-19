@@ -79,6 +79,9 @@ type Proxy struct {
 	// 请求日志回调——每次请求完成后调用
 	OnRequestLog func(log RequestLog)
 
+	// 语义缓存：非 nil 时启用缓存检查（在路由之前）。
+	Cache SemanticCache
+
 	// 调试锁定：非空时强制路由到指定供应商（绕过路由引擎）。
 	// 受 debugMu 保护。
 	debugProvider string
@@ -86,10 +89,17 @@ type Proxy struct {
 }
 
 // RouteMatcher 是路由选择的接口。
-// 根据用户提示词和请求模型名，决定使用哪个供应商。
-// ctx 用于 Embedding API 调用和 LLM 分类器的超时控制。
 type RouteMatcher interface {
 	Match(ctx context.Context, prompt string, model string) *ProviderConfig
+}
+
+// SemanticCache 是语义缓存的接口。
+// 在路由之前检查缓存——如果 prompt 与历史请求语义相似，直接返回缓存结果。
+type SemanticCache interface {
+	// Lookup 查找语义相似的缓存响应。返回 nil 表示未命中。
+	Lookup(ctx context.Context, prompt string) (responseBody []byte, similarity float64, ok bool)
+	// Store 保存响应到缓存，供后续 Lookup 使用。
+	Store(prompt string, responseBody []byte, provider, model string, tokens int)
 }
 
 // RequestLog 是一次代理请求完成后的日志记录。
@@ -235,9 +245,46 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// ── 步骤 2：提取提示词 + 路由 ──
+	// ── 初始化追踪 ──
+	tracking := &RequestTracking{
+		RequestID: uuid.NewString(),
+	}
+
+	// ── 步骤 2：提取提示词 ──
 	prompt := extractPrompt(bodyJSON)
 	modelName, _ := bodyJSON["model"].(string)
+
+	// ── 步骤 2.5：语义缓存检查（在路由之前）──
+	if p.Cache != nil && prompt != "" {
+		if cachedBody, similarity, ok := p.Cache.Lookup(r.Context(), prompt); ok {
+			log.Printf("[缓存] ✓ 命中 (相似度=%.3f, prompt_len=%d)", similarity, len(prompt))
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Ragent-Cache", "hit")
+			w.Header().Set("X-Ragent-Cache-Similarity", fmt.Sprintf("%.3f", similarity))
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "event: cache_hit\ndata: {\"similarity\":%.3f,\"source\":\"semantic_cache\"}\n\n", similarity)
+			w.Write(cachedBody)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// 记录缓存命中的请求日志
+			if p.OnRequestLog != nil {
+				p.OnRequestLog(RequestLog{
+					RequestID:   tracking.RequestID,
+					Prompt:      prompt,
+					Provider:    "cache",
+					Model:       modelName,
+					RouteReason: fmt.Sprintf("cache_hit similarity=%.3f", similarity),
+					Status:      "ok",
+					LatencyMs:   time.Since(startTime).Milliseconds(),
+					Timestamp:   startTime,
+				})
+			}
+			return nil
+		}
+	}
 
 	// 调试锁定：如果设置了 debugProvider，直接使用（绕过路由引擎）。
 	var provider *ProviderConfig
@@ -269,12 +316,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 	// ── 步骤 3：获取或创建供应商熔断器（线程安全）──
 	breaker := p.getOrCreateBreaker(provider.Name)
 
-	// ── 步骤 4：初始化追踪 ──
-	tracking := &RequestTracking{
-		RequestID: uuid.NewString(),
-	}
-
-	// ── 步骤 5：韧性保护 + 上游转发 ──
+	// ── 步骤 4：韧性保护 + 上游转发 ──
 	// 注意：SSE 流式传输一旦开始（WriteHeader 后）就无法重试。
 	// 重试仅在 doUpstreamRequest 内部的连接建立阶段（WriteHeader 之前）。
 	err = breaker.Call(func() error {
@@ -410,16 +452,25 @@ func (p *Proxy) doUpstreamRequest(
 	w.Header().Set("X-Ragent-Model", tracking.Model)
 	w.WriteHeader(http.StatusOK)
 
-	// ── 流式复制 + Token 追踪 ──
+	// ── 流式复制 + Token 追踪 + 响应捕获（用于语义缓存）──
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return fmt.Errorf("streaming not supported")
 	}
 
+	var capturedBody bytes.Buffer
+	teeReader := io.TeeReader(resp.Body, &capturedBody)
 	tracker := NewTokenTracker(w, tracking)
-	_, err = io.Copy(tracker, resp.Body)
+	_, err = io.Copy(tracker, teeReader)
 	if err != nil {
 		return fmt.Errorf("%w: stream copy: %w", ErrStreamStarted, err)
+	}
+
+	// 缓存存储：成功响应后保存到语义缓存。
+	if p.Cache != nil && capturedBody.Len() > 0 {
+		promptText := extractPrompt(body)
+			modelName, _ := body["model"].(string)
+		p.Cache.Store(promptText, capturedBody.Bytes(), provider.Name, modelName, tracking.Usage.TotalTokens)
 	}
 	flusher.Flush()
 

@@ -34,6 +34,7 @@ import (
 	"github.com/ragent/router/internal/provider"
 	"github.com/ragent/router/internal/proxy"
 	"github.com/ragent/router/internal/routing"
+	"github.com/ragent/router/internal/semcache"
 	"github.com/ragent/router/internal/store"
 )
 
@@ -178,6 +179,21 @@ func main() {
 		}
 	}
 
+	// ── 初始化语义缓存（可选，依赖 Embedding 服务）──
+	var cacheService *semcache.Service
+	if embeddingConfigured {
+		cacheStore, err := store.NewSemanticCacheStore(logStore.DB(), 0.92, 1000)
+		if err != nil {
+			log.Printf("[缓存] 初始化失败: %v", err)
+		} else {
+			cacheService = semcache.New(cacheStore, engine.GetEmbeddingService())
+			p.Cache = cacheService
+			log.Println("[缓存] 语义缓存已启用（阈值=0.92, 容量=1000）")
+		}
+	} else {
+		log.Println("[缓存] Embedding 服务未配置，语义缓存已禁用")
+	}
+
 	// ── 构建 HTTP 路由 ──
 	mux := http.NewServeMux()
 
@@ -193,6 +209,7 @@ func main() {
 		ReloadIntents: func(engine *routing.HybridRouter) {
 			reloadIntents(intentStore, engine, providerIDToName)
 		},
+		SemanticCache: cacheService,
 	})
 
 	// ── 启动服务器 ──

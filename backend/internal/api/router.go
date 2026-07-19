@@ -11,6 +11,7 @@ import (
 
 	"github.com/ragent/router/internal/proxy"
 	"github.com/ragent/router/internal/routing"
+	"github.com/ragent/router/internal/semcache"
 	"github.com/ragent/router/internal/store"
 )
 
@@ -22,6 +23,7 @@ type Dependencies struct {
 	RoutingEngine   *routing.HybridRouter
 	Providers       []proxy.ProviderConfig
 	DefaultProvider string
+	SemanticCache   *semcache.Service // 可选：语义缓存服务
 
 	// 可选配置状态
 	EmbeddingConfigured  bool
@@ -50,6 +52,9 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) {
 	mux.HandleFunc("/api/dashboard/recent-routes", r.dashboardRecentRoutes)
 	mux.HandleFunc("/api/dashboard/cost-trend", r.dashboardCostTrend)
 
+	// ── Analytics ──
+	mux.HandleFunc("/api/analytics/model-performance", r.analyticsModelPerf)
+
 	// ── Monitor ──
 	mux.HandleFunc("/api/monitor/overview", r.monitorOverview)
 	mux.HandleFunc("/api/monitor/recent", r.monitorRecent)
@@ -60,6 +65,10 @@ func RegisterRoutes(mux *http.ServeMux, deps Dependencies) {
 	mux.HandleFunc("/api/proxy/activate/", r.proxyActivate)
 	mux.HandleFunc("/api/proxy/health", r.proxyHealth)
 	mux.HandleFunc("/api/ccswitch/providers", r.ccswitchProviders)
+
+	// ── Cache ──
+	mux.HandleFunc("/api/cache/stats", r.cacheStats)
+	mux.HandleFunc("/api/cache/clear", r.cacheClear)
 
 	// ── Resilience ──
 	mux.HandleFunc("/api/resilience/stats", r.resilienceStats)
@@ -184,6 +193,17 @@ func (r *router) dashboardCostTrend(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, map[string]interface{}{"points": points})
+}
+
+// ── Analytics ─────────────────────────────────────────────────────────
+
+func (r *router) analyticsModelPerf(w http.ResponseWriter, _ *http.Request) {
+	items, err := r.LogStore.ModelPerformance()
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]interface{}{"items": items})
 }
 
 // ── Monitor ───────────────────────────────────────────────────────────
@@ -352,6 +372,45 @@ func (r *router) ccswitchProviders(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 	WriteJSON(w, http.StatusOK, map[string]interface{}{"items": items, "total": len(items)})
+}
+
+// ── Cache ──────────────────────────────────────────────────────────────
+
+func (r *router) cacheStats(w http.ResponseWriter, _ *http.Request) {
+	if r.SemanticCache == nil {
+		WriteJSON(w, http.StatusOK, map[string]interface{}{"configured": false})
+		return
+	}
+	stats, err := r.SemanticCache.Stats()
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	count, _ := r.SemanticCache.Count()
+	WriteJSON(w, http.StatusOK, map[string]interface{}{
+		"configured":     true,
+		"total_entries":  stats.TotalEntries,
+		"hits_today":     stats.HitsToday,
+		"misses_today":   stats.MissesToday,
+		"hit_rate":       stats.HitRate,
+		"current_entries": count,
+	})
+}
+
+func (r *router) cacheClear(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		WriteError(w, http.StatusMethodNotAllowed, "需要 POST 请求")
+		return
+	}
+	if r.SemanticCache == nil {
+		WriteError(w, http.StatusServiceUnavailable, "缓存服务未配置")
+		return
+	}
+	if err := r.SemanticCache.Clear(); err != nil {
+		WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "缓存已清空"})
 }
 
 // ── Resilience ────────────────────────────────────────────────────────

@@ -665,6 +665,11 @@ func (r *HybridRouter) Stats() RouteStats {
 	}
 }
 
+// GetEmbeddingService 返回嵌入服务（供缓存等外部模块使用）。
+func (r *HybridRouter) GetEmbeddingService() EmbeddingService {
+	return r.embeddingSvc
+}
+
 // CacheSize 返回嵌入向量缓存的当前条目数。
 func (r *HybridRouter) CacheSize() int {
 	return r.cache.Size()

@@ -353,6 +353,48 @@ func (s *LogStore) ByModel() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// ModelPerformance 返回各模型的效果分析数据（延迟、成本、使用量）。
+func (s *LogStore) ModelPerformance() ([]map[string]interface{}, error) {
+	rows, err := s.db.Query(`
+		SELECT model, provider,
+			COUNT(1) as requests,
+			COALESCE(AVG(latency_ms), 0) as avg_latency,
+			COALESCE(AVG(prompt_tokens), 0) + COALESCE(AVG(completion_tokens), 0) as avg_tokens,
+			COALESCE(SUM(cost_usd), 0) as total_cost,
+			COALESCE(AVG(cost_usd), 0) as avg_cost,
+			COALESCE(SUM(total_tokens), 0) as total_tokens
+		FROM request_logs
+		WHERE created_at >= datetime('now', '-30 days')
+		GROUP BY model, provider
+		ORDER BY requests DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("model performance: %w", err)
+	}
+	defer rows.Close()
+
+	var result []map[string]interface{}
+	for rows.Next() {
+		var model, provider string
+		var requests int64
+		var avgLatency, avgTokens, totalCost, avgCost, totalTokens float64
+		if err := rows.Scan(&model, &provider, &requests, &avgLatency, &avgTokens, &totalCost, &avgCost, &totalTokens); err != nil {
+			return nil, fmt.Errorf("scan performance: %w", err)
+		}
+		result = append(result, map[string]interface{}{
+			"model":        model,
+			"provider":     provider,
+			"requests":     requests,
+			"avg_latency_ms": float64(int(avgLatency)),
+			"avg_tokens":   float64(int(avgTokens)),
+			"total_cost_usd": float64(int(totalCost*10000)) / 10000,
+			"avg_cost_usd": float64(int(avgCost*1000000)) / 1000000,
+			"total_tokens": int(totalTokens),
+		})
+	}
+	return result, rows.Err()
+}
+
 // ────────────────────────────────────────────────────────────
 // 数据库迁移
 // ────────────────────────────────────────────────────────────

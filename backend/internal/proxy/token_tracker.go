@@ -1,8 +1,6 @@
 package proxy
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"io"
 	"strings"
@@ -61,27 +59,22 @@ type RequestTracking struct {
 //
 // # 跨 chunk 解析
 //
-// bufio.Scanner 在 TokenTracker 生命周期内复用，配合 bytes.Buffer 缓冲
-// 不完整的行，解决 SSE 事件被 TCP chunk 边界切断的问题。
+// 维护一个行缓冲区 accumulator，每次 Write 将新数据追加到缓冲区，
+// 然后按换行符分割处理。不完整的最后一行保留到下次 Write 继续拼接。
+// 这解决了 SSE 事件被 TCP chunk 边界切断的问题。
 type TokenTracker struct {
-	writer  io.Writer         // 底层 Writer（HTTP ResponseWriter）
-	track   *RequestTracking  // 收集到的元数据（修改此对象）
-	mu      sync.Mutex        // 保护 track 的并发写入
-	buf     bytes.Buffer      // 跨 chunk 缓冲（保存上次未完成的行）
-	scanner *bufio.Scanner    // 跨 chunk 复用的扫描器
+	writer      io.Writer        // 底层 Writer（HTTP ResponseWriter）
+	track       *RequestTracking // 收集到的元数据（修改此对象）
+	mu          sync.Mutex       // 保护 track 的并发写入
+	accumulator string           // 跨 chunk 行缓冲
 }
 
 // NewTokenTracker 创建解析器。
-// w 是数据实际写入的目标（通常是 HTTP ResponseWriter），
-// track 中的字段会在流式传输过程中被逐步填充。
 func NewTokenTracker(w io.Writer, track *RequestTracking) *TokenTracker {
-	t := &TokenTracker{
+	return &TokenTracker{
 		writer: w,
 		track:  track,
 	}
-	t.scanner = bufio.NewScanner(&t.buf)
-	t.scanner.Buffer(make([]byte, 64*1024), 64*1024)
-	return t
 }
 
 // Write 实现 io.Writer。
@@ -107,21 +100,22 @@ func (t *TokenTracker) Write(p []byte) (int, error) {
 //	data: <JSON payload>\n
 //	\n                        ← 空行表示事件结束
 //
-// 跨 chunk 处理：上一个 chunk 末尾的不完整行会被保留在 t.buf 中，
-// 与当前 chunk 拼接后再扫描，解决 TCP 分包切断 SSE 事件的问题。
+// 跨 chunk 处理：不完整的行保留在 accumulator 中，与后续 chunk 拼接。
 func (t *TokenTracker) scanForUsage(chunk []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// 将当前 chunk 追加到跨 chunk 缓冲区。
-	t.buf.Write(chunk)
+	// 追加到累积缓冲区，按换行符分割
+	t.accumulator += string(chunk)
+	lines := strings.Split(t.accumulator, "\n")
+	// 最后一行可能不完整，保留到下次
+	t.accumulator = lines[len(lines)-1]
+	lines = lines[:len(lines)-1]
 
 	var currentEvent string
 	var dataLines []string
 
-	for t.scanner.Scan() {
-		line := t.scanner.Text()
-
+	for _, line := range lines {
 		if strings.HasPrefix(line, "event: ") {
 			currentEvent = strings.TrimPrefix(line, "event: ")
 		} else if strings.HasPrefix(line, "data: ") {
@@ -134,29 +128,7 @@ func (t *TokenTracker) scanForUsage(chunk []byte) {
 		}
 	}
 
-	// scanner.Scan() 失败时，缓冲区中剩余的数据是不完整的行
-	// → 保留在 t.buf 中等待下一个 chunk。
-	// 重置 buffer：保留未处理完的数据 + 清空已消费的数据。
-	// 注意：bufio.Scanner 在 Scan() 返回 false 后，buffer 中
-	// 保留的是未完成的行，需要保留这些数据。
-	if t.scanner.Err() != nil {
-		// Scanner buffer 太小或其他错误 → 清空缓冲区避免数据错位。
-		t.buf.Reset()
-	} else {
-		// 正常情况：scanner 消费了所有完整行。
-		// 将 buffer 中的数据替换为剩余未扫描的数据。
-		// 由于 bufio.Scanner 已经读走了完整行，buf 中剩余的是不完整行。
-		remaining := t.buf.Bytes()
-		if len(remaining) > 0 {
-			newBuf := bytes.NewBuffer(make([]byte, 0, len(remaining)+4096))
-			newBuf.Write(remaining)
-			t.buf = *newBuf
-			t.scanner = bufio.NewScanner(&t.buf)
-			t.scanner.Buffer(make([]byte, 64*1024), 64*1024)
-		}
-	}
-
-	// 处理可能在 data 后面没有空行的情况。
+	// chunk 末尾没有空行结束的事件（data 后直接 EOF）
 	if len(dataLines) > 0 {
 		t.processEvent(currentEvent, strings.Join(dataLines, ""))
 	}
@@ -252,15 +224,11 @@ func (t *TokenTracker) extractUsage(payload map[string]interface{}) {
 		t.track.Usage.CacheCreationTokens = max(t.track.Usage.CacheCreationTokens, int(v))
 	}
 
-	// OpenAI 的 total_tokens（如果直接提供了）
-	if t.track.Usage.TotalTokens == 0 {
-		if v, ok := usage["total_tokens"].(float64); ok {
-			t.track.Usage.TotalTokens = int(v)
-		}
-	}
-
-	// 如果 total_tokens 未直接提供，用 input+output 计算
-	if t.track.Usage.TotalTokens == 0 {
+	// OpenAI 优先使用显式提供的 total_tokens，否则用 input+output 动态计算。
+	// 每次 extractUsage 调用都重新计算，适应跨 chunk 逐步更新的场景。
+	if v, ok := usage["total_tokens"].(float64); ok {
+		t.track.Usage.TotalTokens = max(t.track.Usage.TotalTokens, int(v))
+	} else {
 		t.track.Usage.TotalTokens = t.track.Usage.InputTokens + t.track.Usage.OutputTokens
 	}
 }
