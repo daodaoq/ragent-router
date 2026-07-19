@@ -25,6 +25,7 @@
 package routing
 
 import (
+	"context"
 	"sort"
 	"strings"
 
@@ -107,10 +108,15 @@ func NewRuleEngine(rules []Rule, providers map[string]*proxy.ProviderConfig, def
 //  4. 返回任意一个已启用的供应商
 //
 // 返回值 nil 表示没有任何可用供应商。
-func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
+// Match 实现基于关键词规则的路由匹配。
+// ctx 参数为接口统一保留，关键词匹配不需要 context（纯内存计算）。
+//
+// 仅做关键词匹配，未命中返回 nil。
+// 默认回退逻辑已移至 HybridRouter.Match() 的策略 4 层。
+func (e *RuleEngine) Match(_ context.Context, prompt string, model string) *proxy.ProviderConfig {
 	promptLower := strings.ToLower(prompt)
 
-	// 阶段 1：尝试规则匹配。
+	// 阶段 1：按优先级从高到低匹配关键词规则。
 	for _, rule := range e.rules {
 		if !e.ruleMatches(rule, promptLower) {
 			continue
@@ -120,7 +126,8 @@ func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 		}
 	}
 
-	// 阶段 2：尝试按请求的模型名匹配。
+	// 阶段 2：如果请求了特定模型（model != "" 且 != "auto"），
+	// 寻找名称中包含该模型名的供应商。
 	if model != "" && model != "auto" {
 		for _, prov := range e.providers {
 			if prov.Enabled && strings.Contains(strings.ToLower(prov.Name), strings.ToLower(model)) {
@@ -129,17 +136,7 @@ func (e *RuleEngine) Match(prompt string, model string) *proxy.ProviderConfig {
 		}
 	}
 
-	// 阶段 3：回退到默认供应商。
-	if prov, ok := e.providers[e.defaultProvider]; ok && prov.Enabled {
-		return prov
-	}
-
-	// 阶段 4：返回任意启用的供应商。
-	for _, prov := range e.providers {
-		if prov.Enabled {
-			return prov
-		}
-	}
+	// 无关键词命中 → 返回 nil，由上层 HybridRouter 继续尝试其他策略。
 	return nil
 }
 

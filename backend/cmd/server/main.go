@@ -64,10 +64,86 @@ func main() {
 		providerMap[providers[i].Name] = &providers[i]
 	}
 
-	// ── 初始化路由引擎 ──
+	// ── 初始化意图存储（SQLite）──
+	intentStore, err := store.NewIntentStore(logStore.DB())
+	if err != nil {
+		log.Fatalf("[启动] 意图存储初始化失败: %v", err)
+	}
+
+	// 首次启动写入默认意图树。
+	if err := intentStore.SeedDefaults(); err != nil {
+		log.Printf("[警告] 种子意图写入失败: %v", err)
+	}
+
+	// 从 DB 加载启用的叶子意图。
+	leafRecords, err := intentStore.ListLeaves()
+	if err != nil {
+		log.Fatalf("[启动] 加载叶子意图失败: %v", err)
+	}
+
+	// 构建 provider_id → provider_name 映射。
+	providerIDToName := make(map[string]string)
+	for _, prov := range providers {
+		providerIDToName[prov.ID] = prov.Name
+	}
+
+	// 将 DB 记录转换为路由引擎的 Intent 列表。
+	loadedIntents := intentRecordsToIntents(leafRecords, providerIDToName)
+	if len(loadedIntents) == 0 {
+		// DB 无数据 → 回退到硬编码默认值。
+		log.Println("[启动] 意图树为空，使用硬编码默认意图")
+		loadedIntents = routing.DefaultIntents()
+	} else {
+		log.Printf("[启动] 从 DB 加载了 %d 个叶子意图", len(loadedIntents))
+	}
+
+	// ── 初始化路由引擎（三阶段混合路由）──
 	rules := routing.DefaultRules()
-	defaultProvider := "deepseek"
-	engine := routing.NewRuleEngine(rules, providerMap, defaultProvider)
+	defaultProvider := "DeepSeek"
+
+	// 构建 HybridRouter——每个阶段都是可插拔的。
+	hybridCfg := routing.HybridConfig{
+		Keywords:        rules,
+		Intents:         loadedIntents,
+		Providers:       providerMap,
+		DefaultProvider: defaultProvider,
+	}
+	embeddingConfigured := false
+	classifierConfigured := false
+
+	// ── 可选的 Embedding 语义匹配层 ──
+	if embeddingKey := os.Getenv("EMBEDDING_API_KEY"); embeddingKey != "" {
+		embCfg := routing.OpenAIEmbeddingConfig{
+			Endpoint: getEnv("EMBEDDING_ENDPOINT", "https://api.openai.com/v1/embeddings"),
+			APIKey:   embeddingKey,
+			Model:    getEnv("EMBEDDING_MODEL", "text-embedding-3-small"),
+		}
+		hybridCfg.EmbeddingService = routing.NewOpenAIEmbeddingService(embCfg)
+		embeddingConfigured = true
+	}
+
+	// ── 可选的 LLM 意图分类器 ──
+	if classifierKey := os.Getenv("CLASSIFIER_API_KEY"); classifierKey != "" {
+		clsCfg := routing.ClassifierConfig{
+			Endpoint: getEnv("CLASSIFIER_ENDPOINT", "https://api.deepseek.com/v1/chat/completions"),
+			APIKey:   classifierKey,
+			Model:    getEnv("CLASSIFIER_MODEL", "deepseek-chat"),
+		}
+		hybridCfg.Classifier = routing.NewLLMIntentClassifier(clsCfg)
+		classifierConfigured = true
+	}
+
+	engine := routing.NewHybridRouter(hybridCfg)
+
+	// 预热意图嵌入向量（如果配置了 Embedding 服务）。
+	if embeddingConfigured {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := engine.Init(ctx); err != nil {
+			log.Printf("[警告] 意图嵌入预热失败: %v（语义匹配层已禁用）", err)
+			// 预热失败不阻止启动——自动降级到关键词 + LLM 分类。
+		}
+		cancel()
+	}
 
 	// ── 创建代理（核心韧性组件在此组装）──
 	p := proxy.NewProxy(proxy.Config{
@@ -339,6 +415,163 @@ func main() {
 		writeJSON(w, http.StatusOK, stats)
 	})
 
+	// ── 路由策略统计（各层命中次数）──
+	mux.HandleFunc("/api/routing/stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := engine.Stats()
+		total := stats.KeywordHits + stats.EmbeddingHits + stats.ClassifierHits + stats.FallbackHits
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"keyword_hits":    stats.KeywordHits,
+			"embedding_hits":  stats.EmbeddingHits,
+			"classifier_hits": stats.ClassifierHits,
+			"fallback_hits":   stats.FallbackHits,
+			"total":           total,
+			"cache_size":      engine.CacheSize(),
+		})
+	})
+
+	// ════════════════════════════════════════════════════════════
+	// 意图树管理 API
+	// ════════════════════════════════════════════════════════════
+
+	// 获取完整意图树。
+	mux.HandleFunc("/api/intent/tree", func(w http.ResponseWriter, r *http.Request) {
+		records, err := intentStore.ListAll()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		roots := store.ToTree(records)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"roots": roots})
+	})
+
+	// 获取分类器配置状态。
+	mux.HandleFunc("/api/intent/classifier", func(w http.ResponseWriter, r *http.Request) {
+		if classifierConfigured {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"configured":    true,
+				"provider_name": getEnv("CLASSIFIER_MODEL", "deepseek-chat"),
+				"model":         getEnv("CLASSIFIER_MODEL", "deepseek-chat"),
+				"source":        "env",
+			})
+		} else {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"configured": false,
+				"message":    "未配置 CLASSIFIER_API_KEY 环境变量，LLM 分类不可用",
+			})
+		}
+	})
+
+	// 获取默认供应商信息。
+	mux.HandleFunc("/api/intent/default-provider", func(w http.ResponseWriter, r *http.Request) {
+		for _, prov := range providers {
+			if prov.Name == defaultProvider {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"found": true, "id": prov.ID, "name": prov.Name,
+				})
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"found": false})
+	})
+
+	// 意图分类（返回详细候选列表）。
+	mux.HandleFunc("/api/intent/classify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "需要 POST 请求"})
+			return
+		}
+		var body struct {
+			Question   string `json:"question"`
+			AutoSwitch bool   `json:"auto_switch"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if body.Question == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "question 不能为空"})
+			return
+		}
+
+		result := engine.Classify(r.Context(), body.Question)
+
+		// 自动切换逻辑。
+		if body.AutoSwitch && result.Matched != nil && result.Matched.ProviderID != "" {
+			result.Switched = &routing.SwitchResult{
+				Success:      true,
+				ProviderName: result.Matched.ProviderName,
+				Detail:       "已自动切换到 " + result.Matched.ProviderName,
+			}
+		} else if body.AutoSwitch {
+			result.Switched = &routing.SwitchResult{
+				Success:      true,
+				ProviderName: result.DefaultProvider.Name,
+				Fallback:     true,
+				Detail:       "未匹配 → 兜底 " + result.DefaultProvider.Name,
+			}
+		}
+
+		writeJSON(w, http.StatusOK, result)
+	})
+
+	// 创建意图节点。
+	mux.HandleFunc("/api/intent/nodes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var node store.IntentNodeRecord
+			if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+				return
+			}
+			// 确保 examples 字段为有效 JSON 数组。
+			if node.Examples == "" {
+				node.Examples = "[]"
+			}
+			if err := intentStore.Insert(&node); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			reloadIntents(intentStore, engine, providerIDToName)
+			writeJSON(w, http.StatusCreated, map[string]interface{}{"success": true})
+			return
+		}
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	})
+
+	// 更新/删除意图节点。
+	mux.HandleFunc("/api/intent/nodes/", func(w http.ResponseWriter, r *http.Request) {
+		code := strings.TrimPrefix(r.URL.Path, "/api/intent/nodes/")
+		if code == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 intent_code"})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPatch:
+			var node store.IntentNodeRecord
+			if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+				return
+			}
+			if err := intentStore.Update(code, &node); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			reloadIntents(intentStore, engine, providerIDToName)
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+
+		case http.MethodDelete:
+			if err := intentStore.Delete(code); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			reloadIntents(intentStore, engine, providerIDToName)
+			writeJSON(w, http.StatusNoContent, nil)
+
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		}
+	})
+
 	// ── 启动服务器 ──
 	addr := fmt.Sprintf(":%d", *port)
 	server := &http.Server{
@@ -365,6 +598,16 @@ func main() {
 	for _, prov := range providers {
 		log.Printf("[启动]   - %s (%s)", prov.Name, prov.Model)
 	}
+
+	// 打印路由策略信息。
+	strategy := "关键词规则"
+	if embeddingConfigured {
+		strategy += " + Embedding语义匹配"
+	}
+	if classifierConfigured {
+		strategy += " + LLM意图分类器"
+	}
+	log.Printf("[启动] 路由策略: %s", strategy)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("[启动] 服务异常退出: %v", err)
 	}
@@ -465,6 +708,62 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// ────────────────────────────────────────────────────────────
+// 意图管理辅助函数
+// ────────────────────────────────────────────────────────────
+
+// intentRecordsToIntents 将 DB 中的叶子节点记录转换为路由引擎的 Intent。
+func intentRecordsToIntents(records []store.IntentNodeRecord, providerIDToName map[string]string) []routing.Intent {
+	result := make([]routing.Intent, 0, len(records))
+	for i, r := range records {
+		providerName := "unknown"
+		if r.ProviderID != nil {
+			if name, ok := providerIDToName[*r.ProviderID]; ok {
+				providerName = name
+			}
+		}
+
+		var examples []string
+		if r.Examples != "" {
+			json.Unmarshal([]byte(r.Examples), &examples)
+		}
+		if examples == nil {
+			examples = []string{}
+		}
+
+		result = append(result, routing.Intent{
+			IntentCode:  r.IntentCode,
+			Name:        r.Name,
+			Description: r.Description,
+			Examples:    examples,
+			Provider:    providerName,
+			Priority:    100 - i,
+		})
+	}
+	return result
+}
+
+// reloadIntents 从 DB 重载意图并热更新路由引擎。
+func reloadIntents(is *store.IntentStore, engine *routing.HybridRouter, idToName map[string]string) {
+	records, err := is.ListLeaves()
+	if err != nil {
+		log.Printf("[意图] 重载失败: %v", err)
+		return
+	}
+	intents := intentRecordsToIntents(records, idToName)
+	if len(intents) == 0 {
+		log.Println("[意图] 无启用的叶子节点，跳过重载")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := engine.ReloadIntents(ctx, intents); err != nil {
+		log.Printf("[意图] 热重载失败: %v", err)
+	} else {
+		log.Printf("[意图] 热重载完成: %d 个叶子意图", len(intents))
+	}
 }
 
 // writeJSON 以 JSON 格式写回响应。

@@ -68,8 +68,9 @@ type Proxy struct {
 
 // RouteMatcher 是路由选择的接口。
 // 根据用户提示词和请求模型名，决定使用哪个供应商。
+// ctx 用于 Embedding API 调用和 LLM 分类器的超时控制。
 type RouteMatcher interface {
-	Match(prompt string, model string) *ProviderConfig
+	Match(ctx context.Context, prompt string, model string) *ProviderConfig
 }
 
 // RequestLog 是一次代理请求完成后的日志记录。
@@ -210,7 +211,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) error {
 	prompt := extractPrompt(bodyJSON)
 	modelName, _ := bodyJSON["model"].(string)
 
-	provider := p.matcher.Match(prompt, modelName)
+	provider := p.matcher.Match(r.Context(), prompt, modelName)
 	if provider == nil {
 		// 降级：取第一个启用的供应商
 		for _, pv := range p.providers {

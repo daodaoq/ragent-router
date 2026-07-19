@@ -56,6 +56,11 @@ func (s *LogStore) Close() error {
 	return s.db.Close()
 }
 
+// DB 返回底层 *sql.DB（供 IntentStore 等复用同一连接）。
+func (s *LogStore) DB() *sql.DB {
+	return s.db
+}
+
 // ────────────────────────────────────────────────────────────
 // 写入操作
 // ────────────────────────────────────────────────────────────
