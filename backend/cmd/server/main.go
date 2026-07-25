@@ -67,6 +67,18 @@ func main() {
 	// ── 初始化认证 ──
 	middleware.InitAuth()
 
+	// ── 初始化 Redis 深度功能 ──
+	common.InitStreamProducers() // Redis Streams 消息队列
+	common.InitEventBus()        // Redis Pub/Sub 事件总线
+	common.InitMetrics()         // Prometheus 指标采集
+	common.InitWebSocket()       // WebSocket 实时推送
+
+	// ── 初始化 Elasticsearch（可选）──
+	common.InitElasticsearch()
+
+	// ── 初始化链路追踪 ──
+	common.InitTracing()
+
 	// ── 初始化旧存储层（用于日志和意图，复用 GORM 的 DB 连接）──
 	gormDB, err := model.DB.DB()
 	if err != nil {
@@ -183,10 +195,12 @@ func main() {
 
 	// ── 请求日志回调 ──
 	p.OnRequestLog = func(rl proxy.RequestLog) {
+		prompt := store.CompactPrompt(rl.Prompt, 500)
+
 		// 写入旧存储（兼容）
-		record := &store.RequestLogRecord{
+		logStore.Insert(&store.RequestLogRecord{
 			ID:                uuid.NewString(),
-			Prompt:            store.CompactPrompt(rl.Prompt, 500),
+			Prompt:            prompt,
 			PromptTokens:      rl.PromptTokens,
 			CompletionTokens:  rl.CompletionTokens,
 			TotalTokens:       rl.TotalTokens,
@@ -199,12 +213,11 @@ func main() {
 			CostUSD:           rl.CostUSD,
 			LatencyMs:         rl.LatencyMs,
 			CreatedAt:         rl.Timestamp,
-		}
-		logStore.Insert(record)
+		})
 
-		// 写入新 GORM 存储
+		// 写入 GORM 存储
 		model.InsertLog(&model.RequestLog{
-			Prompt:            store.CompactPrompt(rl.Prompt, 500),
+			Prompt:            prompt,
 			PromptTokens:      rl.PromptTokens,
 			CompletionTokens:  rl.CompletionTokens,
 			TotalTokens:       rl.TotalTokens,
@@ -217,6 +230,47 @@ func main() {
 			CostUSD:           rl.CostUSD,
 			LatencyMs:         rl.LatencyMs,
 		})
+
+		// 发布到 Redis Streams（异步消息队列）
+		common.PublishLog(context.Background(), map[string]interface{}{
+			"prompt":   prompt,
+			"model":    rl.Model,
+			"provider": rl.Provider,
+			"status":   rl.Status,
+			"tokens":   rl.TotalTokens,
+			"cost":     rl.CostUSD,
+			"latency":  rl.LatencyMs,
+		})
+
+		// 发布到 Redis Pub/Sub（实时事件广播）
+		common.PublishEvent(common.ChannelRequest, common.EventTypeRequestComplete, map[string]interface{}{
+			"provider": rl.Provider,
+			"model":    rl.Model,
+			"status":   rl.Status,
+		})
+
+		// 写入 Elasticsearch（全文检索）
+		if common.ESClientInstance != nil {
+			common.ESClientInstance.IndexDocument(context.Background(), uuid.NewString(), map[string]interface{}{
+				"prompt":            prompt,
+				"model":             rl.Model,
+				"provider":          rl.Provider,
+				"status":            rl.Status,
+				"route_reason":      rl.RouteReason,
+				"error_detail":      rl.ErrorDetail,
+				"cost_usd":          rl.CostUSD,
+				"latency_ms":        rl.LatencyMs,
+				"prompt_tokens":     rl.PromptTokens,
+				"completion_tokens": rl.CompletionTokens,
+				"total_tokens":      rl.TotalTokens,
+				"created_at":        rl.Timestamp.UnixMilli(),
+			})
+		}
+
+		// 记录 Prometheus 指标
+		common.RecordRequest("POST", rl.Status, rl.Provider, rl.Model,
+			time.Duration(rl.LatencyMs)*time.Millisecond,
+			rl.PromptTokens, rl.CompletionTokens, rl.CostUSD)
 	}
 
 	// ── 语义缓存 ──
@@ -255,6 +309,7 @@ func main() {
 	r := gin.New()
 	r.Use(middleware.Recovery())
 	r.Use(middleware.RequestID())
+	r.Use(common.TraceMiddleware()) // 链路追踪
 	r.Use(middleware.CORSMiddleware())
 	r.Use(gin.Logger())
 

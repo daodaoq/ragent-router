@@ -215,10 +215,58 @@ docker-compose up
 | 语言 | Go 1.22+ |
 | Web 框架 | Gin |
 | ORM | GORM v2（SQLite/MySQL/PostgreSQL） |
-| 缓存 | Redis（可选，降级到内存） |
-| 认证 | JWT + bcrypt |
+| 缓存 | Redis（分布式锁/Lua限流/PubSub/Streams） |
+| 消息队列 | Redis Streams（生产者/消费者/死信队列） |
+| 搜索引擎 | Elasticsearch（全文检索/聚合分析） |
+| 认证 | JWT + bcrypt + RBAC |
+| 实时通信 | WebSocket（Hub 模式/心跳/广播） |
+| 链路追踪 | TraceID 透传（OpenTelemetry 规范） |
+| 指标采集 | Prometheus（/metrics 端点） |
+| RPC | gRPC（Protobuf/拦截器/流式RPC） |
 | 前端 | React 18 + TypeScript + Ant Design + Recharts |
 | 桌面 | Electron + Vite |
+
+### Redis 深度使用
+
+| 功能 | 实现 | 面试考点 |
+|------|------|---------|
+| 分布式锁 | SET NX EX + Lua 原子释放 + Watchdog 续约 | Redlock、误删防护、死锁预防 |
+| 滑动窗口限流 | Sorted Set + Lua 原子操作 | 固定窗口边界突发、限流算法对比 |
+| 令牌桶限流 | Hash + Lua 原子操作 | 突发流量、令牌补充策略 |
+| 多维度限流 | 全局/用户/IP/模型 四维限流 | 限流维度设计、降级策略 |
+| Pub/Sub | 事件总线 + 通配符订阅 + 自动重连 | 消息可靠性、与 Streams 区别 |
+| Streams | 生产者/消费者组/ACK/死信队列 | 消息持久化、消费幂等、死信处理 |
+
+### 消息队列（Redis Streams）
+
+```
+生产者 → XADD → Stream → XREADGROUP → 消费者组
+                                    ↓
+                              处理成功 → XACK
+                              处理失败 → 死信队列
+```
+
+### Elasticsearch 集成
+
+- 请求日志自动写入 ES（异步）
+- 全文检索 prompt 内容
+- 按模型/提供商/时间聚合分析
+- 慢查询排查
+
+### Prometheus 监控
+
+```
+GET /metrics
+
+# 指标列表：
+ragent_requests_total          (Counter)   按 method/status/provider/model
+ragent_request_duration_seconds (Histogram) 延迟分布
+ragent_active_requests         (Gauge)     活跃请求数
+ragent_tokens_total            (Counter)   Token 用量
+ragent_cost_usd_total          (Counter)   累计费用
+ragent_cache_hits_total        (Counter)   缓存命中
+ragent_circuit_breaker_state   (Gauge)     熔断器状态
+```
 
 ## 测试
 

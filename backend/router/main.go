@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/ragent/router/common"
 	"github.com/ragent/router/controller"
 	"github.com/ragent/router/middleware"
 )
@@ -29,6 +30,29 @@ func SetRouter(r *gin.Engine, proxyHandler ProxyHandler) {
 	})
 	r.GET("/readyz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	// Prometheus 指标端点
+	r.GET("/metrics", func(c *gin.Context) {
+		text := common.Metrics.ToPrometheusText()
+		c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		c.String(200, text)
+	})
+
+	// WebSocket 实时推送端点
+	r.GET("/ws", func(c *gin.Context) {
+		if common.WSGlobal != nil {
+			common.WSGlobal.HandleWebSocket(c.Writer, c.Request)
+		}
+	})
+
+	// WebSocket 连接数
+	r.GET("/api/ws/clients", func(c *gin.Context) {
+		count := 0
+		if common.WSGlobal != nil {
+			count = common.WSGlobal.ClientCount()
+		}
+		c.JSON(200, gin.H{"success": true, "data": gin.H{"count": count}})
 	})
 
 	// ── Relay 端点（API Key 认证）──
