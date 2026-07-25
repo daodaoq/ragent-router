@@ -1,12 +1,25 @@
 version: "3.8"
 
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
   backend:
     build: ./backend
     ports:
       - "15722:15722"
     environment:
       - MOCK_MODE=true
+      - REDIS_CONN_STRING=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - CORS_ALLOW_ALL=true
+    depends_on:
+      - redis
     restart: unless-stopped
 
   frontend:
@@ -16,3 +29,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  redis_data:

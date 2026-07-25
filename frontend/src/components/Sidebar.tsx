@@ -7,9 +7,13 @@ import {
   RobotOutlined,
   MonitorOutlined,
   DashboardOutlined,
+  CloudServerOutlined,
+  KeyOutlined,
+  LogoutOutlined,
 } from "@ant-design/icons";
+import { clearToken } from "../api/client";
 
-type Page = "providers" | "traffic" | "settings" | "intent" | "monitor" | "dashboard";
+type Page = "providers" | "traffic" | "settings" | "intent" | "monitor" | "dashboard" | "channels" | "tokens";
 
 interface NavItem {
   key: Page;
@@ -22,12 +26,19 @@ export default function Sidebar({ active, onChange }: { active: Page; onChange: 
 
   const navItems: NavItem[] = [
     { key: "dashboard", icon: <DashboardOutlined />, labelKey: "nav.dashboard" },
+    { key: "channels", icon: <CloudServerOutlined />, labelKey: "nav.channels" },
+    { key: "tokens", icon: <KeyOutlined />, labelKey: "nav.tokens" },
     { key: "providers", icon: <ApiOutlined />, labelKey: "nav.providers" },
     { key: "traffic", icon: <BarChartOutlined />, labelKey: "nav.traffic" },
     { key: "monitor", icon: <MonitorOutlined />, labelKey: "nav.monitor" },
     { key: "intent", icon: <RobotOutlined />, labelKey: "nav.intent" },
     { key: "settings", icon: <SettingOutlined />, labelKey: "nav.settings" },
   ];
+
+  const handleLogout = () => {
+    clearToken();
+    window.location.reload();
+  };
 
   return (
     <div
@@ -97,6 +108,37 @@ export default function Sidebar({ active, onChange }: { active: Page; onChange: 
         );
       })}
       <div style={{ flex: 1 }} />
+      {/* 退出登录 */}
+      <Tooltip title={t("nav.logout")} placement="right" mouseEnterDelay={0.5}>
+        <button
+          onClick={handleLogout}
+          style={{
+            width: 42,
+            height: 42,
+            borderRadius: 10,
+            border: "none",
+            background: "transparent",
+            color: "var(--text-muted)",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 19,
+            transition: "all 0.15s",
+            outline: "none",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.color = "#ff4d4f";
+            e.currentTarget.style.background = "var(--bg-elevated)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.color = "var(--text-muted)";
+            e.currentTarget.style.background = "transparent";
+          }}
+        >
+          <LogoutOutlined />
+        </button>
+      </Tooltip>
       <div style={{ paddingBottom: 14, fontSize: 9, color: "var(--text-muted)", fontWeight: 600, letterSpacing: 1 }}>
         {t("app.version")}
       </div>

@@ -24,7 +24,8 @@ Thumbs.db
 .env.local
 
 # Interview prep (not for public repo)
-docs/
+docs/面试准备文档.md
+docs/秋招Demo-进度记录.md
 
 # Logs
 *.log
@@ -33,3 +34,6 @@ logs/
 # Python (old version artifacts)
 *.pyc
 provider_state.json
+backend/.ua/
+backend/ragent-router.exe~
+*.exe~

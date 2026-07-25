@@ -2,7 +2,7 @@ import { Card, Table, Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 import type { ColumnsType } from "antd/es/table";
 import { useDashboardStore } from "../stores/dashboard";
-import type { RecentRouteItem } from "../api";
+import type { RecentLogItem } from "../api";
 
 const { Text } = Typography;
 
@@ -10,7 +10,7 @@ export default function RecentRoutes() {
   const { t } = useTranslation();
   const { recentRoutes } = useDashboardStore();
 
-  const columns: ColumnsType<RecentRouteItem> = [
+  const columns: ColumnsType<RecentLogItem> = [
     {
       title: t("dashboard.prompt"),
       dataIndex: "prompt",
@@ -24,7 +24,7 @@ export default function RecentRoutes() {
       dataIndex: "model",
       key: "model",
       width: 150,
-      render: (model: string, record: RecentRouteItem) => (
+      render: (model: string, record: RecentLogItem) => (
         <Tag color={record.provider === "claude" ? "purple" : "green"} style={{ fontSize: 12 }}>
           {model}
         </Tag>

@@ -210,7 +210,7 @@ func TestAdapterFactory_Get(t *testing.T) {
 		{"BaiLian", "OpenAI"},
 		{"Claude", "Anthropic"},
 		{"Anthropic", "Anthropic"},
-		{"unknown-provider", "Anthropic"},
+		{"unknown-provider", "OpenAI"},
 	}
 
 	for _, c := range cases {

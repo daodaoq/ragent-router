@@ -1,7 +1,7 @@
 {
   "app": {
     "title": "RAgent Router",
-    "version": "v0.1"
+    "version": "v0.3"
   },
   "nav": {
     "providers": "API 供应商",
@@ -9,7 +9,10 @@
     "dashboard": "仪表盘",
     "monitor": "观测台",
     "intent": "AI 意图",
-    "settings": "设置"
+    "settings": "设置",
+    "channels": "渠道管理",
+    "tokens": "API Key",
+    "logout": "退出登录"
   },
   "traffic": {
     "title": "流量监控",

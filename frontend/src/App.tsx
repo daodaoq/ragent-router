@@ -5,6 +5,7 @@ import TitleBar from "./components/TitleBar";
 import Sidebar from "./components/Sidebar";
 import StatusBar from "./components/StatusBar";
 import SetupBanner from "./components/SetupBanner";
+import { isLoggedIn } from "./api/client";
 import { trafficApi } from "./api";
 
 // 代码分割：页面组件按需加载，减少首屏 bundle 体积。
@@ -14,8 +15,11 @@ const IntentPanel = lazy(() => import("./components/IntentPanel"));
 const MonitorPanel = lazy(() => import("./components/MonitorPanel"));
 const TrafficMonitor = lazy(() => import("./pages/TrafficMonitor"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
+const Login = lazy(() => import("./pages/Login"));
+const Channels = lazy(() => import("./pages/Channels"));
+const Tokens = lazy(() => import("./pages/Tokens"));
 
-type Page = "providers" | "traffic" | "settings" | "intent" | "monitor" | "dashboard";
+type Page = "providers" | "traffic" | "settings" | "intent" | "monitor" | "dashboard" | "channels" | "tokens";
 
 /** 页面加载中的占位 spinner */
 function PageLoader() {
@@ -27,11 +31,14 @@ function PageLoader() {
 }
 
 export default function App() {
-  const [page, setPage] = useState<Page>("providers");
+  const [page, setPage] = useState<Page>("dashboard");
+  const [loggedIn, setLoggedIn] = useState(isLoggedIn());
   const [trafficStats, setTrafficStats] = useState({ requests: 0, todayCost: 0 });
 
   // Fetch real traffic stats for status bar
   useEffect(() => {
+    if (!loggedIn) return;
+
     const fetchStatus = () => {
       trafficApi.getOverview()
         .then(data => {
@@ -49,7 +56,18 @@ export default function App() {
     fetchStatus();
     const interval = setInterval(fetchStatus, 30_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [loggedIn]);
+
+  // 未登录显示登录页面
+  if (!loggedIn) {
+    return (
+      <ErrorBoundary>
+        <Suspense fallback={<PageLoader />}>
+          <Login onLogin={() => setLoggedIn(true)} />
+        </Suspense>
+      </ErrorBoundary>
+    );
+  }
 
   return (
     <ErrorBoundary>
@@ -85,6 +103,8 @@ export default function App() {
           >
             <Suspense fallback={<PageLoader />}>
               {page === "dashboard" && <Dashboard />}
+              {page === "channels" && <Channels />}
+              {page === "tokens" && <Tokens />}
               {page === "providers" && <Providers />}
               {page === "traffic" && <TrafficMonitor />}
               {page === "intent" && <IntentPanel />}

@@ -3,7 +3,7 @@ import {
   dashboardApi,
   type CostOverview,
   type ModelDistributionItem,
-  type RecentRouteItem,
+  type RecentLogItem,
   type CostTrendPoint,
 } from "../api";
 
@@ -11,7 +11,7 @@ interface DashboardState {
   // Data
   overview: CostOverview | null;
   modelDistribution: ModelDistributionItem[];
-  recentRoutes: RecentRouteItem[];
+  recentRoutes: RecentLogItem[];
   costTrend: CostTrendPoint[];
 
   // Loading
@@ -31,17 +31,17 @@ export const useDashboardStore = create<DashboardState>((set) => ({
   fetchAll: async () => {
     set({ loading: true });
     try {
-      const [overview, dist, routes, trend] = await Promise.all([
+      const [overviewRes, distRes, logsRes, trendRes] = await Promise.all([
         dashboardApi.getOverview(),
         dashboardApi.getModelDistribution(),
-        dashboardApi.getRecentRoutes(20),
+        dashboardApi.getRecentLogs(20),
         dashboardApi.getCostTrend(7),
       ]);
       set({
-        overview,
-        modelDistribution: dist.items,
-        recentRoutes: routes.items,
-        costTrend: trend.points,
+        overview: overviewRes?.data ?? null,
+        modelDistribution: distRes?.data ?? [],
+        recentRoutes: logsRes?.data ?? [],
+        costTrend: trendRes?.data ?? [],
         loading: false,
       });
     } catch (err) {

@@ -3,7 +3,7 @@
 
 export { request } from "./client";
 export { dashboardApi } from "./dashboard";
-export type { CostOverview, ModelDistributionItem, RecentRouteItem, CostTrendPoint } from "./dashboard";
+export type { CostOverview, ModelDistributionItem, RecentLogItem, CostTrendPoint, MonitorOverview, ByModelData } from "./dashboard";
 export { proxyApi } from "./proxy";
 export type { ProxyCurrent, ProxyHealth, ActivateResult } from "./proxy";
 export { providersApi } from "./providers";

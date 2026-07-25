@@ -9,31 +9,35 @@ interface Props {
 export default function CostOverview({ overview }: Props) {
   const { t } = useTranslation();
 
+  const savingRate = overview.month_cost > 0
+    ? ((overview.saved_cost / (overview.month_cost + overview.saved_cost)) * 100)
+    : 0;
+
   const cards = [
     {
       title: t("dashboard.todayCost"),
       value: overview.today_cost,
       prefix: "$",
       color: "var(--accent)",
-      precision: 2,
+      precision: 4,
     },
     {
       title: t("dashboard.monthCost"),
       value: overview.month_cost,
       prefix: "$",
       color: "var(--green)",
-      precision: 2,
+      precision: 4,
     },
     {
       title: t("dashboard.saved"),
-      value: overview.saved_amount,
+      value: overview.saved_cost,
       prefix: "$",
       color: "#06b6d4",
-      precision: 2,
+      precision: 4,
     },
     {
       title: t("dashboard.savingRate"),
-      value: overview.saving_rate,
+      value: savingRate,
       suffix: "%",
       color: "var(--orange)",
       precision: 1,

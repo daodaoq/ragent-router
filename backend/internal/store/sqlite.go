@@ -6,10 +6,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	// modernc.org/sqlite 是纯 Go 实现的 SQLite 驱动，无需 CGO。
-	// 选择原因：零 C 依赖，跨平台编译无痛，适合本地嵌入式数据库场景。
-	_ "modernc.org/sqlite"
 )
 
 // LogStore 是请求日志的 SQLite 持久化存储。
@@ -27,6 +23,14 @@ import (
 // WAL 模式下读不阻塞写，Dashboard 查询不影响代理日志写入。
 type LogStore struct {
 	db *sql.DB
+}
+
+// NewLogStoreFromDB 使用外部传入的 *sql.DB 创建 LogStore（避免驱动冲突）。
+func NewLogStoreFromDB(db *sql.DB) (*LogStore, error) {
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return &LogStore{db: db}, nil
 }
 
 // NewLogStore 打开（或创建）SQLite 数据库并自动建表。
