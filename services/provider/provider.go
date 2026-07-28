@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/ragent/router/services/provider/internal/config"
-	"github.com/ragent/router/services/provider/internal/logic"
+	"github.com/ragent/router/services/provider/channel"
 	"github.com/ragent/router/services/provider/internal/svc"
 	"github.com/zeromicro/go-zero/core/conf"
 	"github.com/zeromicro/go-zero/zrpc"
@@ -23,7 +23,7 @@ func main() {
 	svcCtx := svc.NewServiceContext(c)
 
 	// 启动后台健康检查
-	healthLogic := logic.NewHealthCheckLogic(nil, svcCtx)
+	healthLogic := channel.NewHealthCheckLogic(nil, svcCtx)
 	go healthLogic.RunHealthCheck()
 
 	// 启动 gRPC 服务器

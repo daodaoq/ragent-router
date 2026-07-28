@@ -1,10 +1,10 @@
-package middleware
+package mw
 
 import (
+	"github.com/ragent/router/shared/redis"
 	"fmt"
 	"net/http"
 
-	"github.com/ragent/router/shared/redis"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 

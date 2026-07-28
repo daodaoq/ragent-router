@@ -1,4 +1,4 @@
-module github.com/ragent/router
+module github.com/ragent/router/backend
 
 go 1.25.0
 

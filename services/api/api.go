@@ -6,7 +6,7 @@ import (
 	"net/http"
 
 	"github.com/ragent/router/services/api/internal/config"
-	"github.com/ragent/router/services/api/internal/handler"
+	"github.com/ragent/router/services/api/handlers"
 	"github.com/ragent/router/services/api/internal/svc"
 	"github.com/ragent/router/shared/redis"
 	"github.com/zeromicro/go-zero/core/conf"
@@ -32,7 +32,7 @@ func main() {
 	defer server.Stop()
 
 	// 注册路由
-	msgHandler := handler.NewMessagesHandler(svcCtx)
+	msgHandler := handlers.NewMessagesHandler(svcCtx)
 	server.AddRoute(rest.Route{
 		Method:  http.MethodPost,
 		Path:    "/v1/messages",

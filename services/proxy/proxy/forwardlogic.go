@@ -1,4 +1,4 @@
-package logic
+package proxy
 
 import (
 	"bytes"
