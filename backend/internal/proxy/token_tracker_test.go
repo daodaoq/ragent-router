@@ -73,10 +73,59 @@ func TestTokenTracker_OpenAIUsage(t *testing.T) {
 	}
 }
 
-// TODO: 跨 chunk SSE 解析——accumulator 方式需要进一步调试。
-// 当前单 chunk 内的 SSE 事件解析通过全部测试。
+// TestTokenTracker_CrossChunkSSE 验证跨 TCP chunk 的 SSE 事件解析。
+//
+// 真实场景中，SSE 事件可能被 TCP 分包切断：
+//
+//	Chunk 1: "event: message_start\ndata: {\"message\":{\"id\":\"msg"
+//	Chunk 2: "_001\",\"model\":\"claude-3.5\",\"usage\":{\"input_t"
+//	Chunk 3: "okens\":1000}}}\n\nevent: message_delta\ndata: {\"usage\":{\"output_tokens\":50}}\n\n"
+//
+// TokenTracker 的 accumulator 缓冲区应正确拼接不完整的行。
 func TestTokenTracker_CrossChunkSSE(t *testing.T) {
-	t.Skip("跨 chunk 解析待修复——单 chunk 解析均通过")
+	var buf bytes.Buffer
+	tracking := &RequestTracking{}
+	tracker := NewTokenTracker(&buf, tracking)
+
+	// 将一个完整的 SSE 流拆成 3 个 chunk，模拟 TCP 分包
+	chunks := []string{
+		// Chunk 1: message_start 事件的前半部分（event 行完整，data 行被切断）
+		"event: message_start\n" +
+			`data: {"message":{"id":"msg`,
+		// Chunk 2: data 行的中间部分
+		`_001","model":"claude-3.5","usage":{"input_t`,
+		// Chunk 3: data 行结束 + message_delta 事件完整
+		`okens":1000}}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}` + "\n\n",
+	}
+
+	for i, chunk := range chunks {
+		n, err := tracker.Write([]byte(chunk))
+		if err != nil {
+			t.Fatalf("chunk %d Write 错误: %v", i, err)
+		}
+		if n != len(chunk) {
+			t.Fatalf("chunk %d 写入字节数: want=%d, got=%d", i, len(chunk), n)
+		}
+	}
+
+	// 验证跨 chunk 拼接后正确解析
+	if tracking.UpstreamID != "msg_001" {
+		t.Errorf("UpstreamID: want=msg_001, got=%s", tracking.UpstreamID)
+	}
+	if tracking.Model != "claude-3.5" {
+		t.Errorf("Model: want=claude-3.5, got=%s", tracking.Model)
+	}
+	if tracking.Usage.InputTokens != 1000 {
+		t.Errorf("InputTokens: want=1000, got=%d", tracking.Usage.InputTokens)
+	}
+	if tracking.Usage.OutputTokens != 50 {
+		t.Errorf("OutputTokens: want=50, got=%d", tracking.Usage.OutputTokens)
+	}
+	if tracking.Usage.TotalTokens != 1050 {
+		t.Errorf("TotalTokens: want=1050, got=%d", tracking.Usage.TotalTokens)
+	}
 }
 
 func TestTokenTracker_TeeWriter(t *testing.T) {

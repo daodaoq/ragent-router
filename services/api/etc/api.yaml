@@ -1,0 +1,44 @@
+Name: api
+Host: 0.0.0.0
+Port: 15722
+
+# JWT 认证
+Auth:
+  AccessSecret: ragent-jwt-secret-change-me
+  AccessExpire: 86400
+
+# Redis（分布式限流 + 缓存）
+Redis:
+  Host: 127.0.0.1:6379
+  Type: node
+
+# 分布式限流
+RateLimit:
+  Global:
+    Rate: 1000        # 全局 QPS
+    Burst: 2000       # 突发容量
+  PerUser:
+    Rate: 100         # 单用户 QPS
+    Burst: 200
+  PerProvider:
+    Rate: 500         # 单供应商 QPS
+    Burst: 1000
+
+# 下游 RPC 服务
+ProviderRPC:
+  Etcd:
+    Hosts:
+    - 127.0.0.1:2379
+    Key: provider.rpc
+
+RouterRPC:
+  Etcd:
+    Hosts:
+    - 127.0.0.1:2379
+    Key: router.rpc
+
+ProxyRPC:
+  Etcd:
+    Hosts:
+    - 127.0.0.1:2379
+    Key: proxy.rpc

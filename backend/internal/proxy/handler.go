@@ -524,6 +524,7 @@ func (p *Proxy) doUpstreamRequest(
 	teeReader := io.TeeReader(resp.Body, &capturedBody)
 	tracker := NewTokenTracker(w, tracking)
 	_, err = io.Copy(tracker, teeReader)
+	tracker.Flush() // 处理流结束时残余的不完整 SSE 事件
 	if err != nil {
 		return fmt.Errorf("%w: stream copy: %w", ErrStreamStarted, err)
 	}

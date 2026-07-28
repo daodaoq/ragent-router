@@ -1,0 +1,23 @@
+Name: provider.rpc
+ListenOn: 0.0.0.0:8081
+Etcd:
+  Hosts:
+  - 127.0.0.1:2379
+  Key: provider.rpc
+
+# 数据库
+DB:
+  Type: mysql
+  DSN: root:123456@tcp(127.0.0.1:3306)/ragent?charset=utf8mb4&parseTime=True&loc=Local
+
+# Redis
+Redis:
+  Host: 127.0.0.1:6379
+  Type: node
+
+# 健康检查
+HealthCheck:
+  Interval: 30        # 秒
+  Timeout: 5          # 秒
+  FailThreshold: 3    # 连续失败次数 → 自动禁用
+  RecoverThreshold: 3 # 连续成功次数 → 自动恢复

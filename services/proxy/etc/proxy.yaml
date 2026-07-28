@@ -1,0 +1,20 @@
+Name: proxy.rpc
+ListenOn: 0.0.0.0:8083
+Etcd:
+  Hosts:
+  - 127.0.0.1:2379
+  Key: proxy.rpc
+
+Redis:
+  Host: 127.0.0.1:6379
+  Type: node
+
+# 韧性配置
+Resilience:
+  GlobalRateLimit: 1000      # 全局 QPS
+  MaxConcurrent: 500         # 最大并发
+  MaxRetries: 3              # 最大重试
+  RequestTimeout: 300        # 请求超时秒数
+  UpstreamTimeout: 60        # 上游超时秒数
+  FailureThreshold: 0.5      # 熔断阈值
+  OpenTimeout: 30            # 熔断恢复秒数

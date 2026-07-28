@@ -1,8 +1,12 @@
 package controller
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/ragent/router/model"
@@ -156,6 +160,11 @@ func DeleteChannel(c *gin.Context) {
 }
 
 // TestChannel 测试渠道连通性。
+//
+// 向上游 API 发送一个轻量请求（GET /models），验证：
+//   - API Key 是否有效
+//   - BaseURL 是否可达
+//   - 响应延迟
 func TestChannel(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	if id == 0 {
@@ -169,12 +178,80 @@ func TestChannel(c *gin.Context) {
 		return
 	}
 
-	// TODO: 实际测试连通性（发送一个简单的请求到上游）
-	_ = channel
+	// 执行连通性测试
+	start := time.Now()
+	testErr := testChannelConnectivity(channel)
+	latency := time.Since(start).Milliseconds()
+
+	if testErr != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "连通性测试失败: " + testErr.Error(),
+			"data": gin.H{
+				"latency_ms": latency,
+			},
+		})
+		return
+	}
+
+	// 更新渠道测试时间和响应时间
+	channel.TestTime = time.Now().Unix()
+	channel.ResponseTime = int(latency)
+	model.UpdateChannel(channel)
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"message": "连通性测试功能待实现",
+		"message": "连通性测试成功",
+		"data": gin.H{
+			"latency_ms": latency,
+		},
 	})
+}
+
+// testChannelConnectivity 向上游 API 发送轻量请求验证连通性。
+func testChannelConnectivity(channel *model.Channel) error {
+	if channel.BaseURL == "" {
+		return fmt.Errorf("未配置 Base URL")
+	}
+
+	// 构造请求：尝试 GET /v1/models（OpenAI 兼容接口）
+	// 大多数 AI API 都支持此端点
+	testURL := strings.TrimRight(channel.BaseURL, "/") + "/v1/models"
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, testURL, nil)
+	if err != nil {
+		return fmt.Errorf("构造请求失败: %w", err)
+	}
+
+	// 设置认证头
+	req.Header.Set("Authorization", "Bearer "+channel.Key)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应（限制大小避免内存问题）
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("上游返回 %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 401/403 通常表示 API Key 无效
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return fmt.Errorf("认证失败 (HTTP %d): API Key 可能无效", resp.StatusCode)
+	}
+
+	// 404 表示端点不存在，但服务是可达的（某些 API 不支持 /v1/models）
+	if resp.StatusCode == 404 {
+		return nil // 服务可达，只是不支持此端点
+	}
+
+	return nil
 }
 
 // GetChannelTypes 获取支持的渠道类型列表。

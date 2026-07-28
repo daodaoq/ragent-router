@@ -1,0 +1,123 @@
+version: "3.8"
+
+# RAgent Router 微服务架构部署
+#
+# 高并发组件：
+#   - Redis: 分布式限流/缓存/熔断状态同步/异步日志
+#   - etcd: 服务发现（go-zero 默认）
+#   - MySQL: 持久化存储
+
+services:
+  # ── 基础设施 ──
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.0
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+    volumes:
+      - etcd_data:/etcd-data
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=ragent_root
+      - MYSQL_DATABASE=ragent
+      - MYSQL_USER=ragent
+      - MYSQL_PASSWORD=ragent_pass
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── 微服务 ──
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    ports:
+      - "15722:15722"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - ETCD_HOSTS=etcd:2379
+    depends_on:
+      - redis
+      - etcd
+      - provider
+      - router
+      - proxy
+    restart: unless-stopped
+
+  provider:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.provider
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - DB_DSN=ragent:ragent_pass@tcp(mysql:3306)/ragent?charset=utf8mb4&parseTime=True&loc=Local
+      - ETCD_HOSTS=etcd:2379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      etcd:
+        condition: service_started
+    restart: unless-stopped
+
+  router:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.router
+    ports:
+      - "8082:8082"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - ETCD_HOSTS=etcd:2379
+    depends_on:
+      - redis
+      - etcd
+    restart: unless-stopped
+
+  proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.proxy
+    ports:
+      - "8083:8083"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - ETCD_HOSTS=etcd:2379
+    depends_on:
+      - redis
+      - etcd
+      - provider
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  etcd_data:
+  mysql_data:

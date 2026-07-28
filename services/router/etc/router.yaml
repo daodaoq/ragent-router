@@ -1,0 +1,15 @@
+Name: router.rpc
+ListenOn: 0.0.0.0:8082
+Etcd:
+  Hosts:
+  - 127.0.0.1:2379
+  Key: router.rpc
+
+Redis:
+  Host: 127.0.0.1:6379
+  Type: node
+
+# 路由缓存
+RoutingCache:
+  TTL: 60           # 路由结果缓存秒数
+  MaxSize: 10000    # 最大缓存条目

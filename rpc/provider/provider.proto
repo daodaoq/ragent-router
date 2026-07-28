@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package rpc.provider;
+
+option go_package = "github.com/ragent/router/rpc/provider";
+
+// ProviderService 渠道管理 RPC 服务。
+service ProviderService {
+  // GetChannel 获取单个渠道信息。
+  rpc GetChannel(GetChannelReq) returns (ChannelInfo);
+  // ListChannels 获取渠道列表。
+  rpc ListChannels(ListChannelsReq) returns (ListChannelsResp);
+  // CheckHealth 检查渠道健康状态。
+  rpc CheckHealth(CheckHealthReq) returns (CheckHealthResp);
+  // GetHealthyProviders 获取健康供应商列表（供路由使用）。
+  rpc GetHealthyProviders(GetHealthyReq) returns (GetHealthyResp);
+}
+
+message GetChannelReq {
+  int64 id = 1;
+}
+
+message ChannelInfo {
+  int64 id = 1;
+  string name = 2;
+  string base_url = 3;
+  string models = 4;
+  int32 status = 5;       // 1=启用, 2=禁用, 3=自动禁用
+  int32 weight = 6;
+  int64 priority = 7;
+  string group = 8;
+  int32 response_time = 9; // 毫秒
+}
+
+message ListChannelsReq {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+
+message ListChannelsResp {
+  repeated ChannelInfo channels = 1;
+  int64 total = 2;
+}
+
+message CheckHealthReq {
+  int64 channel_id = 1;
+}
+
+message CheckHealthResp {
+  bool healthy = 1;
+  int32 latency_ms = 2;
+  string error = 3;
+}
+
+message GetHealthyReq {
+  string model = 1; // 按模型过滤
+}
+
+message GetHealthyResp {
+  repeated ChannelInfo providers = 1;
+}

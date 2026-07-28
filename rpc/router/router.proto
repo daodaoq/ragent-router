@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package rpc.router;
+
+option go_package = "github.com/ragent/router/rpc/router";
+
+// RouterService 路由引擎 RPC 服务。
+service RouterService {
+  // Classify 对用户提示词进行意图分类，返回最佳供应商。
+  rpc Classify(ClassifyReq) returns (ClassifyResp);
+  // GetRoutingStats 获取路由统计信息。
+  rpc GetRoutingStats(StatsReq) returns (StatsResp);
+}
+
+message ClassifyReq {
+  string prompt = 1;
+  string model = 2;
+}
+
+message ClassifyResp {
+  string provider_name = 1;    // 匹配的供应商名
+  string strategy = 2;         // keyword / embedding / llm / fallback
+  double confidence = 3;       // 置信度 (0.0-1.0)
+  int64 latency_ms = 4;        // 分类耗时
+  string route_reason = 5;     // 路由原因描述
+}
+
+message StatsReq {}
+
+message StatsResp {
+  int64 keyword_hits = 1;
+  int64 embedding_hits = 2;
+  int64 classifier_hits = 3;
+  int64 fallback_hits = 4;
+  int64 total = 5;
+  int64 cache_size = 6;
+}

@@ -9,6 +9,42 @@ services:
       - redis_data:/data
     restart: unless-stopped
 
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-ragent_root}
+      - MYSQL_DATABASE=ragent
+      - MYSQL_USER=ragent
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-ragent_pass}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build: ./backend
     ports:
@@ -16,10 +52,18 @@ services:
     environment:
       - MOCK_MODE=true
       - REDIS_CONN_STRING=redis://redis:6379
+      - DB_TYPE=mysql
+      - DB_DSN=ragent:ragent_pass@tcp(mysql:3306)/ragent?charset=utf8mb4&parseTime=True&loc=Local
+      - ES_URL=http://elasticsearch:9200
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - CORS_ALLOW_ALL=true
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -32,3 +76,5 @@ services:
 
 volumes:
   redis_data:
+  mysql_data:
+  es_data:

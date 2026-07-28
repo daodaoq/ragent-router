@@ -67,6 +67,11 @@ type TokenTracker struct {
 	track       *RequestTracking // 收集到的元数据（修改此对象）
 	mu          sync.Mutex       // 保护 track 的并发写入
 	accumulator string           // 跨 chunk 行缓冲
+
+	// 跨 chunk SSE 解析状态——当一个事件的 event 行和 data 行
+	// 被 TCP 分包切断时，需要在多次 Write 调用之间保持解析进度。
+	currentEvent string   // 当前正在解析的事件类型
+	dataLines    []string // 当前事件已收集的 data 行
 }
 
 // NewTokenTracker 创建解析器。
@@ -101,6 +106,7 @@ func (t *TokenTracker) Write(p []byte) (int, error) {
 //	\n                        ← 空行表示事件结束
 //
 // 跨 chunk 处理：不完整的行保留在 accumulator 中，与后续 chunk 拼接。
+// 只处理以空行结尾的完整事件，未完成的事件保留在解析状态中等待后续 chunk。
 func (t *TokenTracker) scanForUsage(chunk []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -112,25 +118,40 @@ func (t *TokenTracker) scanForUsage(chunk []byte) {
 	t.accumulator = lines[len(lines)-1]
 	lines = lines[:len(lines)-1]
 
-	var currentEvent string
-	var dataLines []string
-
 	for _, line := range lines {
 		if strings.HasPrefix(line, "event: ") {
-			currentEvent = strings.TrimPrefix(line, "event: ")
+			t.currentEvent = strings.TrimPrefix(line, "event: ")
 		} else if strings.HasPrefix(line, "data: ") {
-			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
-		} else if line == "" && len(dataLines) > 0 {
+			t.dataLines = append(t.dataLines, strings.TrimPrefix(line, "data: "))
+		} else if line == "" && len(t.dataLines) > 0 {
 			// 空行 = 一个 SSE 事件结束。
-			t.processEvent(currentEvent, strings.Join(dataLines, ""))
-			currentEvent = ""
-			dataLines = nil
+			t.processEvent(t.currentEvent, strings.Join(t.dataLines, ""))
+			t.currentEvent = ""
+			t.dataLines = nil
 		}
 	}
+	// 注意：不在这里处理未完成的事件——可能还有后续 chunk 补充数据。
+	// 由调用方在流结束时调用 Flush() 处理残余数据。
+}
 
-	// chunk 末尾没有空行结束的事件（data 后直接 EOF）
-	if len(dataLines) > 0 {
-		t.processEvent(currentEvent, strings.Join(dataLines, ""))
+// Flush 处理流结束后 accumulator 中残余的不完整事件。
+// 应在 io.Copy 完成后调用，确保最后一个没有尾部空行的事件也被解析。
+func (t *TokenTracker) Flush() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// 将 accumulator 中残余的不完整行也当作 data 处理
+	if t.accumulator != "" {
+		if strings.HasPrefix(t.accumulator, "data: ") {
+			t.dataLines = append(t.dataLines, strings.TrimPrefix(t.accumulator, "data: "))
+		}
+		t.accumulator = ""
+	}
+
+	if len(t.dataLines) > 0 {
+		t.processEvent(t.currentEvent, strings.Join(t.dataLines, ""))
+		t.currentEvent = ""
+		t.dataLines = nil
 	}
 }
 

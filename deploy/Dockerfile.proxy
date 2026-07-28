@@ -1,0 +1,14 @@
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app/proxy ./services/proxy
+
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/proxy /app/proxy
+COPY --from=builder /app/services/proxy/etc /app/etc
+EXPOSE 8083
+WORKDIR /app
+CMD ["./proxy", "-f", "etc/proxy.yaml"]

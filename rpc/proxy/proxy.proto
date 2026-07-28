@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package rpc.proxy;
+
+option go_package = "github.com/ragent/router/rpc/proxy";
+
+// ProxyService 代理转发 RPC 服务。
+service ProxyService {
+  // Forward 转发请求到上游供应商（Unary，返回完整响应）。
+  rpc Forward(ForwardReq) returns (ForwardResp);
+  // GetStatus 获取代理状态。
+  rpc GetStatus(StatusReq) returns (ProxyStatus);
+  // GetBreakerStats 获取熔断器统计。
+  rpc GetBreakerStats(BreakerStatsReq) returns (BreakerStatsResp);
+}
+
+message StatusReq {}
+
+message ForwardReq {
+  string provider_name = 1;
+  string model = 2;
+  bytes request_body = 3;     // 原始请求体
+  map<string, string> headers = 4;
+}
+
+message ForwardResp {
+  int32 status_code = 1;
+  bytes response_body = 2;
+  map<string, string> headers = 3;
+  int64 latency_ms = 4;
+  int32 prompt_tokens = 5;
+  int32 completion_tokens = 6;
+  string upstream_id = 7;
+}
+
+message ProxyStatus {
+  int64 total_requests = 1;
+  int32 active_requests = 2;
+  int32 provider_count = 3;
+  bool healthy = 4;
+}
+
+message BreakerStatsReq {
+  string provider_name = 1;
+}
+
+message BreakerStatsResp {
+  string state = 1;            // closed / open / half-open
+  int64 total_failures = 2;
+  int64 total_successes = 3;
+  int64 window_failures = 4;
+  int64 window_successes = 5;
+}
