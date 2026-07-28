@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	proxy "github.com/ragent/router/services/proxy/proxy"
-	routing "github.com/ragent/router/services/router/routing"
+	"github.com/ragent/router/shared/routing"
 	semcache "github.com/ragent/router/services/proxy/semcache"
 	"github.com/ragent/router/shared/store"
 )

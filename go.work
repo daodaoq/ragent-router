@@ -1,0 +1,10 @@
+go 1.22.7
+
+use (
+	./shared
+	./rpc
+	./services/api
+	./services/provider
+	./services/router
+	./services/proxy
+)

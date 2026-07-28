@@ -1,14 +1,16 @@
 FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /app/api ./services/api
+WORKDIR /build
+COPY go.work .
+COPY shared/ shared/
+COPY rpc/ rpc/
+COPY services/ services/
+WORKDIR /build/services/api
+RUN GOPROXY=https://goproxy.cn,direct go mod download
+RUN CGO_ENABLED=0 go build -o /app/api .
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/api /app/api
-COPY --from=builder /app/services/api/etc /app/etc
-EXPOSE 15722
+COPY services/api/etc /app/etc
 WORKDIR /app
 CMD ["./api", "-f", "etc/api.yaml"]
