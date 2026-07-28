@@ -1,0 +1,119 @@
+//goctl api go -api api.api -dir . -style go_zero
+
+type (
+    // LoginReq 登录请求
+    LoginReq {
+        Username string `json:"username" validate:"required"`
+        Password string `json:"password" validate:"required"`
+    }
+
+    // LoginResp 登录响应
+    LoginResp {
+        Success bool   `json:"success"`
+        Token   string `json:"token"`
+        Message string `json:"message"`
+    }
+
+    // ChannelReq 渠道请求
+    ChannelReq {
+        Name    string `json:"name" validate:"required"`
+        Type    int    `json:"type"`
+        Key     string `json:"key" validate:"required"`
+        BaseURL string `json:"base_url"`
+        Models  string `json:"models"`
+        Weight  int    `json:"weight"`
+        Group   string `json:"group"`
+    }
+
+    // ChannelResp 渠道响应
+    ChannelResp {
+        Success bool        `json:"success"`
+        Message string      `json:"message"`
+        Data    interface{} `json:"data,omitempty"`
+    }
+
+    // ClassifyReq 分类请求
+    ClassifyReq {
+        Prompt     string `json:"question" validate:"required"`
+        AutoSwitch bool   `json:"auto_switch"`
+    }
+
+    // ClassifyResp 分类响应
+    ClassifyResp {
+        Matched  interface{} `json:"matched"`
+        Switched interface{} `json:"switched,omitempty"`
+    }
+)
+
+@server (
+    jwt:   Auth
+    group: user
+)
+
+service api {
+    @handler Login
+    post /api/user/login (LoginReq) returns (LoginResp)
+
+    @handler Register
+    post /api/user/register (LoginReq) returns (LoginResp)
+}
+
+@server (
+    group: channel
+)
+
+service api {
+    @handler ListChannels
+    get /api/channels returns (ChannelResp)
+
+    @handler CreateChannel
+    post /api/channels (ChannelReq) returns (ChannelResp)
+
+    @handler UpdateChannel
+    put /api/channels/:id (ChannelReq) returns (ChannelResp)
+
+    @handler DeleteChannel
+    delete /api/channels/:id returns (ChannelResp)
+
+    @handler TestChannel
+    post /api/channels/:id/test returns (ChannelResp)
+}
+
+@server (
+    group: routing
+)
+
+service api {
+    @handler ClassifyIntent
+    post /api/intent/classify (ClassifyReq) returns (ClassifyResp)
+
+    @handler RoutingStats
+    get /api/routing/stats returns (ClassifyResp)
+}
+
+@server (
+    group: proxy
+)
+
+service api {
+    @handler ProxyHealth
+    get /api/proxy/health returns (ChannelResp)
+
+    @handler ResilienceStats
+    get /api/resilience/stats returns (ChannelResp)
+}
+
+@server (
+    group: dashboard
+)
+
+service api {
+    @handler DashboardOverview
+    get /api/dashboard/overview returns (ChannelResp)
+
+    @handler ModelDistribution
+    get /api/dashboard/model-distribution returns (ChannelResp)
+
+    @handler RecentRoutes
+    get /api/dashboard/recent-routes returns (ChannelResp)
+}
