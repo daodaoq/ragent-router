@@ -1,12 +1,16 @@
 # Dependencies
 node_modules/
 __pycache__/
+
+# Database
 *.db
 *.db.bak
+*.sqlite
 
 # Build output
 *.exe
 *.test
+*.out
 dist/
 release/
 
@@ -14,6 +18,7 @@ release/
 .idea/
 .vscode/
 *.swp
+*.swo
 
 # OS
 .DS_Store
@@ -23,17 +28,15 @@ Thumbs.db
 .env
 .env.local
 
-# Interview prep (not for public repo)
-docs/面试准备文档.md
-docs/秋招Demo-进度记录.md
-
 # Logs
 *.log
 logs/
 
-# Python (old version artifacts)
-*.pyc
+# SciTools Understand
+.ua/
+
+# Temporary
+*.tmp
+*.bak
+*~
 provider_state.json
-backend/.ua/
-backend/ragent-router.exe~
-*.exe~
