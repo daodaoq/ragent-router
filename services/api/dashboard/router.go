@@ -20,7 +20,7 @@ type Dependencies struct {
 	Proxy           *proxy.Proxy
 	LogStore        *store.LogStore
 	IntentStore     *store.IntentStore
-	RoutingEngine   *routing.HybridRouter
+	RoutingEngine   routing.RouterEngine  // 接口，实际实现在 router 服务
 	Providers       []proxy.ProviderConfig
 	DefaultProvider string
 	SemanticCache   *semcache.Service // 可选：语义缓存服务
@@ -30,7 +30,7 @@ type Dependencies struct {
 	ClassifierConfigured bool
 
 	// 意图热重载器
-	ReloadIntents func(engine *routing.HybridRouter)
+	ReloadIntents func(engine routing.RouterEngine)
 }
 
 // RegisterRoutes 将所有 API 路由注册到 mux。

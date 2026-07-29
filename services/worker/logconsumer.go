@@ -17,24 +17,71 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/ragent/router/shared/redis"
+	"github.com/ragent/router/shared/store"
 	goRedis "github.com/redis/go-redis/v9"
 )
+
+// ────────────────────────────────────────────────────────────
+// Worker 指标（Prometheus 兼容）
+// ────────────────────────────────────────────────────────────
+
+// workerMetrics 内部计数器（线程安全，无外部依赖）。
+//
+// 面试考点：
+//   - 使用 atomic 而非 Mutex，因为计数器场景只需原子操作
+//   - 计数器可在 /metrics 端点暴露为 Prometheus 格式
+type workerMetrics struct {
+	consumedTotal  atomic.Int64 // 已消费消息总数
+	dbWriteOK      atomic.Int64 // DB 写入成功数
+	dbWriteFail    atomic.Int64 // DB 写入失败数
+	esWriteOK      atomic.Int64 // ES 写入成功数
+	esWriteFail    atomic.Int64 // ES 写入失败数
+	latencySumMs   atomic.Int64 // 延迟累计值（用于计算平均值）
+}
+
+// Snapshot 指标快照。
+type MetricSnapshot struct {
+	ConsumedTotal int64 `json:"consumed_total"`
+	DBWriteOK     int64 `json:"db_write_ok"`
+	DBWriteFail   int64 `json:"db_write_fail"`
+	ESWriteOK     int64 `json:"es_write_ok"`
+	ESWriteFail   int64 `json:"es_write_fail"`
+	AvgLatencyMs  int64 `json:"avg_latency_ms"`
+}
+
+// ────────────────────────────────────────────────────────────
+// LogConsumerWorker
+// ────────────────────────────────────────────────────────────
 
 // LogConsumerWorker 日志消费者 Worker。
 type LogConsumerWorker struct {
 	consumer *redis.StreamConsumer
+	mysql    *store.MySQLLogStore  // 可选，为 nil 时跳过 DB 写入
+	es       *store.ESLogStore     // 可选，为 nil 时跳过 ES 写入
+	metrics  workerMetrics
+}
+
+// WorkerConfig Worker 配置。
+type WorkerConfig struct {
+	ConsumerName string            // 消费者名称（用于 Consumer Group 内区分）
+	MySQL        *store.MySQLLogStore // MySQL 存储（可选）
+	ES           *store.ESLogStore    // ES 存储（可选）
 }
 
 // NewLogConsumerWorker 创建日志消费者。
-func NewLogConsumerWorker(consumerName string) *LogConsumerWorker {
-	w := &LogConsumerWorker{}
+func NewLogConsumerWorker(cfg WorkerConfig) *LogConsumerWorker {
+	w := &LogConsumerWorker{
+		mysql: cfg.MySQL,
+		es:    cfg.ES,
+	}
 	w.consumer = redis.NewStreamConsumer(
 		redis.StreamRequestLog,
 		redis.GroupLogConsumer,
-		consumerName,
+		cfg.ConsumerName,
 		w.handleMessage,
 	)
 	return w
@@ -53,6 +100,8 @@ func (w *LogConsumerWorker) Start(ctx context.Context) {
 
 // handleMessage 处理单条日志消息。
 func (w *LogConsumerWorker) handleMessage(msg goRedis.XMessage) error {
+	w.metrics.consumedTotal.Add(1)
+
 	data, ok := msg.Values["data"].(string)
 	if !ok {
 		return nil
@@ -65,37 +114,125 @@ func (w *LogConsumerWorker) handleMessage(msg goRedis.XMessage) error {
 	}
 
 	// ── 写入 MySQL ──
-	if err := w.writeToDB(entry); err != nil {
+	if err := w.writeToDB(msg.ID, entry); err != nil {
 		log.Printf("[日志消费者] DB 写入失败: %v", err)
 		return err
 	}
 
 	// ── 写入 Elasticsearch ──
-	if err := w.writeToES(entry); err != nil {
+	if err := w.writeToES(msg.ID, entry); err != nil {
 		log.Printf("[日志消费者] ES 写入失败: %v", err)
 		// ES 失败不阻塞，继续处理
 	}
 
-	// ── 更新 Prometheus 指标 ──
+	// ── 更新指标 ──
 	w.updateMetrics(entry)
 
 	return nil
 }
 
-func (w *LogConsumerWorker) writeToDB(entry redis.RequestLogEntry) error {
-	// 实际实现：调用 GORM 写入 request_logs 表
-	log.Printf("[日志消费者] DB: provider=%s, model=%s, latency=%dms",
-		entry.Provider, entry.Model, entry.LatencyMs)
+// writeToDB 写入 MySQL（使用 GORM）。
+//
+// 面试考点：
+//   - 使用 GORM 的 Create 而非原生 SQL，自动处理字段映射和零值
+//   - 生产环境应使用批量写入（InsertBatch）减少 DB 压力
+//   - 失败时返回 error 触发消息重试（不 ACK → 留在 Pending List）
+func (w *LogConsumerWorker) writeToDB(msgID string, entry redis.RequestLogEntry) error {
+	if w.mysql == nil {
+		// MySQL 未配置，仅打印日志
+		log.Printf("[日志消费者] DB(skip): provider=%s, model=%s, latency=%dms",
+			entry.Provider, entry.Model, entry.LatencyMs)
+		return nil
+	}
+
+	record := &store.MySQLRequestLogRecord{
+		ID:               msgID, // 使用 Redis Stream 消息 ID 作为唯一标识
+		Model:            entry.Model,
+		Provider:         entry.Provider,
+		LatencyMs:        entry.LatencyMs,
+		PromptTokens:     entry.PromptTokens,
+		CompletionTokens: entry.CompletionTokens,
+		TotalTokens:      entry.TotalTokens,
+		CostUSD:          entry.CostUSD,
+		CreatedAt:        time.UnixMilli(entry.Timestamp),
+	}
+
+	if entry.Status == "success" || entry.StatusCode >= 200 && entry.StatusCode < 300 {
+		record.Status = "ok"
+	} else {
+		record.Status = "error"
+	}
+
+	if err := w.mysql.Insert(record); err != nil {
+		w.metrics.dbWriteFail.Add(1)
+		return err
+	}
+	w.metrics.dbWriteOK.Add(1)
 	return nil
 }
 
-func (w *LogConsumerWorker) writeToES(entry redis.RequestLogEntry) error {
-	// 实际实现：调用 ES client IndexDocument
+// writeToES 写入 Elasticsearch（全文检索）。
+//
+// 面试考点：
+//   - ES 用于按 prompt 全文搜索，MySQL 做结构化查询，各司其职
+//   - 使用 Bulk API 批量写入提升吞吐（此处为单条，生产环境应攒批）
+//   - ES 写入失败不影响主流程，降级为仅 MySQL 存储
+func (w *LogConsumerWorker) writeToES(msgID string, entry redis.RequestLogEntry) error {
+	if w.es == nil {
+		return nil
+	}
+
+	status := "ok"
+	if entry.StatusCode >= 400 {
+		status = "error"
+	}
+
+	doc := &store.ESDocument{
+		ID:               msgID,
+		PromptTokens:     entry.PromptTokens,
+		CompletionTokens: entry.CompletionTokens,
+		TotalTokens:      entry.TotalTokens,
+		Model:            entry.Model,
+		Provider:         entry.Provider,
+		Status:           status,
+		LatencyMs:        entry.LatencyMs,
+		CostUSD:          entry.CostUSD,
+	}
+
+	if err := w.es.Index(context.Background(), doc); err != nil {
+		w.metrics.esWriteFail.Add(1)
+		return err
+	}
+	w.metrics.esWriteOK.Add(1)
 	return nil
 }
 
+// updateMetrics 更新内部计数器。
+//
+// 面试考点：
+//   - 原子操作（atomic）比 Mutex 轻量，适合纯计数场景
+//   - 平均延迟 = latencySumMs / consumedTotal（无锁近似计算）
+//   - 指标可通过 /metrics 端点暴露为 Prometheus text format
 func (w *LogConsumerWorker) updateMetrics(entry redis.RequestLogEntry) {
-	// 实际实现：更新 Prometheus counter/histogram
+	w.metrics.latencySumMs.Add(entry.LatencyMs)
+}
+
+// Metrics 返回当前指标快照。
+func (w *LogConsumerWorker) Metrics() MetricSnapshot {
+	consumed := w.metrics.consumedTotal.Load()
+	latencySum := w.metrics.latencySumMs.Load()
+	avgLatency := int64(0)
+	if consumed > 0 {
+		avgLatency = latencySum / consumed
+	}
+	return MetricSnapshot{
+		ConsumedTotal: consumed,
+		DBWriteOK:     w.metrics.dbWriteOK.Load(),
+		DBWriteFail:   w.metrics.dbWriteFail.Load(),
+		ESWriteOK:     w.metrics.esWriteOK.Load(),
+		ESWriteFail:   w.metrics.esWriteFail.Load(),
+		AvgLatencyMs:  avgLatency,
+	}
 }
 
 // recoverPending 定期恢复 Pending 消息。
