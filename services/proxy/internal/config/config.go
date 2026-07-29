@@ -19,4 +19,11 @@ type Config struct {
 		FailureThreshold float64 // 熔断阈值
 		OpenTimeout      int     // 熔断恢复秒数
 	}
+
+	// RocketMQ 配置（可选，为空时降级为仅 Redis Streams）
+	RocketMQ struct {
+		NameServer string // NameServer 地址，如 "127.0.0.1:9876"
+		Topic      string // 日志 Topic
+		Group      string // 生产者组名
+	}
 }

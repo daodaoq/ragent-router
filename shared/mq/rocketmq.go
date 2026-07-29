@@ -20,6 +20,11 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/apache/rocketmq-client-go/v2"
+	"github.com/apache/rocketmq-client-go/v2/consumer"
+	"github.com/apache/rocketmq-client-go/v2/primitive"
+	"github.com/apache/rocketmq-client-go/v2/producer"
 )
 
 // ────────────────────────────────────────────────────────────
@@ -63,6 +68,45 @@ type ProviderEventMessage struct {
 }
 
 // ────────────────────────────────────────────────────────────
+// 全局 Producer（单例）
+// ────────────────────────────────────────────────────────────
+
+var (
+	globalProducerOnce sync.Once
+	globalProducer     *RocketMQProducer
+)
+
+// InitGlobalProducer 初始化全局 RocketMQ Producer（应在服务启动时调用一次）。
+//
+// 参数：
+//   - nameSrvAddr: NameServer 地址（如 "127.0.0.1:9876"）
+//   - topic: 目标 Topic
+//   - group: 生产者组名
+//
+// 如果 nameSrvAddr 为空，Producer 不会初始化（降级为仅 Redis Streams）。
+func InitGlobalProducer(nameSrvAddr, topic, group string) {
+	if nameSrvAddr == "" {
+		log.Printf("[RocketMQ] NameServer 未配置，跳过初始化（仅使用 Redis Streams）")
+		return
+	}
+	globalProducerOnce.Do(func() {
+		globalProducer = NewRocketMQProducer(nameSrvAddr, topic, group, 10000)
+	})
+}
+
+// GetGlobalProducer 获取全局 Producer（可能为 nil）。
+func GetGlobalProducer() *RocketMQProducer {
+	return globalProducer
+}
+
+// CloseGlobalProducer 关闭全局 Producer（服务优雅退出时调用）。
+func CloseGlobalProducer() {
+	if globalProducer != nil {
+		globalProducer.Close()
+	}
+}
+
+// ────────────────────────────────────────────────────────────
 // RocketMQ Producer（生产者）
 // ────────────────────────────────────────────────────────────
 
@@ -77,23 +121,12 @@ type ProviderEventMessage struct {
 type RocketMQProducer struct {
 	nameSrvAddr string
 	topic       string
-	msgCh       chan *Message // 异步发送缓冲区
-	done        chan struct{}
-	wg          sync.WaitGroup
+	group       string
+	producer    rocketmq.Producer
 
-	// 统计
+	mu          sync.Mutex
 	sentCount   int64
 	failedCount int64
-}
-
-// Message 统一消息结构。
-type Message struct {
-	Topic   string            `json:"topic"`
-	Tag     string            `json:"tag"`
-	Body    []byte            `json:"body"`
-	Keys    string            `json:"keys"`    // 消息 Key（用于消息追踪）
-	Delay   int               `json:"delay"`   // 延迟级别（1-18，对应 1s-2h）
-	Headers map[string]string `json:"headers"` // 自定义属性
 }
 
 // NewRocketMQProducer 创建 RocketMQ 生产者。
@@ -101,8 +134,9 @@ type Message struct {
 // 参数：
 //   - nameSrvAddr: NameServer 地址（如 "127.0.0.1:9876"）
 //   - topic: 目标 Topic
-//   - bufferSize: 异步缓冲区大小
-func NewRocketMQProducer(nameSrvAddr, topic string, bufferSize int) *RocketMQProducer {
+//   - group: 生产者组名
+//   - bufferSize: 异步发送缓冲区大小
+func NewRocketMQProducer(nameSrvAddr, topic, group string, bufferSize int) *RocketMQProducer {
 	if bufferSize <= 0 {
 		bufferSize = 10000
 	}
@@ -110,13 +144,24 @@ func NewRocketMQProducer(nameSrvAddr, topic string, bufferSize int) *RocketMQPro
 	p := &RocketMQProducer{
 		nameSrvAddr: nameSrvAddr,
 		topic:       topic,
-		msgCh:       make(chan *Message, bufferSize),
-		done:        make(chan struct{}),
+		group:       group,
 	}
 
-	// 启动异步发送协程
-	p.wg.Add(1)
-	go p.asyncSendLoop()
+	// 创建真实 RocketMQ Producer
+	p.producer, _ = rocketmq.NewProducer(
+		producer.WithNameServer([]string{nameSrvAddr}),
+		producer.WithGroupName(group),
+		producer.WithRetry(2),
+		producer.WithSendMsgTimeout(3*time.Second),
+	)
+
+	if err := p.producer.Start(); err != nil {
+		log.Printf("[RocketMQ Producer] 启动失败: %v（降级为无 MQ 模式）", err)
+		p.producer = nil
+	} else {
+		log.Printf("[RocketMQ Producer] 启动成功: namesrv=%s, topic=%s, group=%s",
+			nameSrvAddr, topic, group)
+	}
 
 	return p
 }
@@ -126,62 +171,99 @@ func NewRocketMQProducer(nameSrvAddr, topic string, bufferSize int) *RocketMQPro
 // 适用场景：重要业务消息（订单创建、支付通知）。
 // 重试策略：默认重试 2 次，总耗时约 3 秒。
 func (p *RocketMQProducer) SendSync(ctx context.Context, tag, key string, body interface{}) error {
+	if p.producer == nil {
+		return fmt.Errorf("rocketmq producer not initialized")
+	}
+
 	data, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal message: %w", err)
 	}
 
-	msg := &Message{
+	msg := &primitive.Message{
 		Topic: p.topic,
-		Tag:   tag,
 		Body:  data,
-		Keys:  key,
+	}
+	msg.WithTag(tag)
+	if key != "" {
+		msg.WithKeys([]string{key})
 	}
 
-	// 实际实现：
-	// producer, _ := rocketmq.NewProducer(...)
-	// result, err := producer.SendSync(ctx, msg)
-	// return err
-
-	// 模拟：放入缓冲区
-	select {
-	case p.msgCh <- msg:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	result, err := p.producer.SendSync(ctx, msg)
+	if err != nil {
+		p.mu.Lock()
+		p.failedCount++
+		p.mu.Unlock()
+		return fmt.Errorf("send sync: %w", err)
 	}
+
+	p.mu.Lock()
+	p.sentCount++
+	p.mu.Unlock()
+
+	if os.Getenv("MQ_DEBUG") == "true" {
+		log.Printf("[RocketMQ Producer] SendSync: topic=%s tag=%s key=%s msgID=%s",
+			p.topic, tag, key, result.MsgID)
+	}
+	return nil
 }
 
 // SendAsync 异步发送（高吞吐，回调通知结果）。
 //
 // 适用场景：日志、监控指标等允许少量丢失的消息。
 // 优势：不阻塞调用方，吞吐量比同步高 3-5 倍。
-func (p *RocketMQProducer) SendAsync(tag, key string, body interface{}, callback func(error)) {
-	data, err := json.Marshal(body)
-	if err != nil {
+func (p *RocketMQProducer) SendAsync(ctx context.Context, tag, key string, body interface{}, callback func(error)) {
+	if p.producer == nil {
 		if callback != nil {
-			callback(err)
+			callback(fmt.Errorf("rocketmq producer not initialized"))
 		}
 		return
 	}
 
-	msg := &Message{
-		Topic: p.topic,
-		Tag:   tag,
-		Body:  data,
-		Keys:  key,
+	data, err := json.Marshal(body)
+	if err != nil {
+		if callback != nil {
+			callback(fmt.Errorf("marshal message: %w", err))
+		}
+		return
 	}
 
-	select {
-	case p.msgCh <- msg:
-		// 异步发送，结果通过回调通知
-		if callback != nil {
-			go callback(nil) // 模拟成功回调
+	msg := &primitive.Message{
+		Topic: p.topic,
+		Body:  data,
+	}
+	msg.WithTag(tag)
+	if key != "" {
+		msg.WithKeys([]string{key})
+	}
+
+	err = p.producer.SendAsync(ctx, func(ctx context.Context, result *primitive.SendResult, err error) {
+		if err != nil {
+			p.mu.Lock()
+			p.failedCount++
+			p.mu.Unlock()
+			log.Printf("[RocketMQ Producer] SendAsync 失败: topic=%s tag=%s err=%v",
+				p.topic, tag, err)
+		} else {
+			p.mu.Lock()
+			p.sentCount++
+			p.mu.Unlock()
+			if os.Getenv("MQ_DEBUG") == "true" {
+				log.Printf("[RocketMQ Producer] SendAsync: topic=%s tag=%s key=%s msgID=%s",
+					p.topic, tag, key, result.MsgID)
+			}
 		}
-	default:
-		p.failedCount++
 		if callback != nil {
-			go callback(errBufferFull)
+			callback(err)
+		}
+	}, msg)
+
+	if err != nil {
+		p.mu.Lock()
+		p.failedCount++
+		p.mu.Unlock()
+		if callback != nil {
+			callback(fmt.Errorf("send async: %w", err))
 		}
 	}
 }
@@ -190,20 +272,37 @@ func (p *RocketMQProducer) SendAsync(tag, key string, body interface{}, callback
 //
 // 适用场景：监控指标、审计日志等对可靠性要求不高的消息。
 // 特点：fire-and-forget，吞吐量最高但可能丢消息。
-func (p *RocketMQProducer) SendOneway(tag, key string, body interface{}) {
-	data, _ := json.Marshal(body)
-	msg := &Message{
-		Topic: p.topic,
-		Tag:   tag,
-		Body:  data,
-		Keys:  key,
+func (p *RocketMQProducer) SendOneway(ctx context.Context, tag, key string, body interface{}) {
+	if p.producer == nil {
+		return
 	}
 
-	select {
-	case p.msgCh <- msg:
-	default:
-		// 缓冲区满，静默丢弃
+	data, err := json.Marshal(body)
+	if err != nil {
+		p.mu.Lock()
 		p.failedCount++
+		p.mu.Unlock()
+		return
+	}
+
+	msg := &primitive.Message{
+		Topic: p.topic,
+		Body:  data,
+	}
+	msg.WithTag(tag)
+	if key != "" {
+		msg.WithKeys([]string{key})
+	}
+
+	if err := p.producer.SendOneWay(ctx, msg); err != nil {
+		p.mu.Lock()
+		p.failedCount++
+		p.mu.Unlock()
+		log.Printf("[RocketMQ Producer] SendOneway 失败: %v", err)
+	} else {
+		p.mu.Lock()
+		p.sentCount++
+		p.mu.Unlock()
 	}
 }
 
@@ -215,83 +314,63 @@ func (p *RocketMQProducer) SendOneway(tag, key string, body interface{}) {
 //	10=6m, 11=7m, 12=8m, 13=9m, 14=10m, 15=20m, 16=30m, 17=1h, 18=2h
 //
 // 面试考点：延迟消息的实现原理——Timer + 时间轮算法。
-func (p *RocketMQProducer) SendDelayMessage(tag, key string, body interface{}, delayLevel int) {
-	data, _ := json.Marshal(body)
-	msg := &Message{
+func (p *RocketMQProducer) SendDelayMessage(ctx context.Context, tag, key string, body interface{}, delayLevel int) {
+	if p.producer == nil {
+		return
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return
+	}
+
+	msg := &primitive.Message{
 		Topic: p.topic,
-		Tag:   tag,
 		Body:  data,
-		Keys:  key,
-		Delay: delayLevel,
 	}
+	msg.WithTag(tag)
+	if key != "" {
+		msg.WithKeys([]string{key})
+	}
+	msg.WithDelayTimeLevel(delayLevel)
 
-	select {
-	case p.msgCh <- msg:
-	default:
+	if err := p.producer.SendOneWay(ctx, msg); err != nil {
+		p.mu.Lock()
 		p.failedCount++
+		p.mu.Unlock()
+		log.Printf("[RocketMQ Producer] SendDelay 失败: %v", err)
+	} else {
+		p.mu.Lock()
+		p.sentCount++
+		p.mu.Unlock()
 	}
-}
-
-// asyncSendLoop 异步发送循环（批量 + 压缩）。
-func (p *RocketMQProducer) asyncSendLoop() {
-	defer p.wg.Done()
-
-	ticker := time.NewTicker(50 * time.Millisecond) // 每 50ms 批量发送
-	batch := make([]*Message, 0, 100)
-
-	for {
-		select {
-		case <-p.done:
-			if len(batch) > 0 {
-				p.flushBatch(batch)
-			}
-			return
-		case msg := <-p.msgCh:
-			batch = append(batch, msg)
-			if len(batch) >= 100 {
-				p.flushBatch(batch)
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				p.flushBatch(batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
-
-func (p *RocketMQProducer) flushBatch(batch []*Message) {
-	// 实际实现：
-	// producer.SendAsync(ctx, batch, callback)
-	if os.Getenv("MQ_DEBUG") == "true" {
-		log.Printf("[RocketMQ Producer] 批量发送 %d 条到 %s", len(batch), p.topic)
-	}
-	p.sentCount += int64(len(batch))
 }
 
 // Stats 生产者统计。
 type ProducerStats struct {
 	SentCount   int64 `json:"sent_count"`
 	FailedCount int64 `json:"failed_count"`
-	BufferSize  int   `json:"buffer_size"`
 }
 
 func (p *RocketMQProducer) Stats() ProducerStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return ProducerStats{
 		SentCount:   p.sentCount,
 		FailedCount: p.failedCount,
-		BufferSize:  len(p.msgCh),
 	}
 }
 
-// Close 优雅关闭（等待缓冲区消息发送完毕）。
+// Close 优雅关闭。
 func (p *RocketMQProducer) Close() {
-	close(p.done)
-	p.wg.Wait()
+	if p.producer != nil {
+		if err := p.producer.Shutdown(); err != nil {
+			log.Printf("[RocketMQ Producer] 关闭失败: %v", err)
+		} else {
+			log.Printf("[RocketMQ Producer] 已关闭 (sent=%d, failed=%d)", p.sentCount, p.failedCount)
+		}
+	}
 }
-
-var errBufferFull = fmt.Errorf("producer buffer full")
 
 // ────────────────────────────────────────────────────────────
 // RocketMQ Consumer（消费者）
@@ -310,7 +389,7 @@ type RocketMQConsumer struct {
 	topic       string
 	group       string
 	handler     func(tag, key string, body []byte) error
-	consumeMode string // "clustering" or "broadcasting"
+	pushConsumer rocketmq.PushConsumer
 }
 
 // NewRocketMQConsumer 创建 RocketMQ 消费者。
@@ -320,7 +399,6 @@ func NewRocketMQConsumer(nameSrvAddr, topic, group string, handler func(tag, key
 		topic:       topic,
 		group:       group,
 		handler:     handler,
-		consumeMode: "clustering",
 	}
 }
 
@@ -331,26 +409,43 @@ func NewRocketMQConsumer(nameSrvAddr, topic, group string, handler func(tag, key
 //  2. 向 Broker 发送心跳，加入 Consumer Group
 //  3. Rebalance 分配队列
 //  4. 拉取消息 → 处理 → 提交 Offset
-func (c *RocketMQConsumer) Start(ctx context.Context) {
-	log.Printf("[RocketMQ Consumer] 启动: topic=%s, group=%s, mode=%s",
-		c.topic, c.group, c.consumeMode)
+func (c *RocketMQConsumer) Start(ctx context.Context) error {
+	log.Printf("[RocketMQ Consumer] 启动: topic=%s, group=%s", c.topic, c.group)
 
-	// 实际实现：
-	// consumer, _ := rocketmq.NewPushConsumer(
-	//     consumer.WithGroupName(c.group),
-	//     consumer.WithNameServerAddr(c.nameSrvAddr),
-	//     consumer.WithConsumeMode(consumer.Clustering),
-	// )
-	// consumer.Subscribe(c.topic, consumer.MessageSelector{}, c.handleMessage)
-	// consumer.Start()
+	c.pushConsumer, _ = rocketmq.NewPushConsumer(
+		consumer.WithNameServer([]string{c.nameSrvAddr}),
+		consumer.WithGroupName(c.group),
+	)
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("[RocketMQ Consumer] 停止: %s", c.group)
-			return
-		default:
-			time.Sleep(time.Second)
-		}
+	err := c.pushConsumer.Subscribe(c.topic, consumer.MessageSelector{},
+		func(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
+			for _, msg := range msgs {
+				tag := msg.GetTags()
+				key := msg.MsgId
+				if err := c.handler(tag, key, msg.Body); err != nil {
+					log.Printf("[RocketMQ Consumer] 处理失败: topic=%s tag=%s err=%v",
+						c.topic, tag, err)
+					return consumer.ConsumeRetryLater, nil
+				}
+			}
+			return consumer.ConsumeSuccess, nil
+		})
+	if err != nil {
+		return fmt.Errorf("subscribe: %w", err)
+	}
+
+	if err := c.pushConsumer.Start(); err != nil {
+		return fmt.Errorf("start consumer: %w", err)
+	}
+
+	<-ctx.Done()
+	log.Printf("[RocketMQ Consumer] 停止: %s", c.group)
+	return c.pushConsumer.Shutdown()
+}
+
+// Stop 停止消费。
+func (c *RocketMQConsumer) Stop() {
+	if c.pushConsumer != nil {
+		c.pushConsumer.Shutdown()
 	}
 }

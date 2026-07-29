@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ragent/router/rpc/proxy"
+	"github.com/ragent/router/shared/mq"
 	"github.com/ragent/router/shared/redis"
 	"github.com/ragent/router/services/proxy/internal/svc"
 	"github.com/zeromicro/go-zero/core/logx"
@@ -191,11 +192,11 @@ func (l *ForwardLogic) getProviderInfo(name string) (string, string) {
 	return info.BaseURL, info.Key
 }
 
-// publishLog 发布请求日志（双通道：Redis Streams + Kafka）。
+// publishLog 发布请求日志（双通道：Redis Streams + RocketMQ）。
 //
 // 高并发方案 4：异步日志写入。
 //   - Redis Streams：轻量级，适合实时监控和 Dashboard
-//   - Kafka：重量级，适合大规模日志聚合和离线分析
+//   - RocketMQ：重量级，适合大规模日志聚合和离线分析
 //   - 两个通道并行写入，互不影响
 //   - 请求处理和日志记录完全解耦，零延迟影响主链路
 func (l *ForwardLogic) publishLog(provider, model string, statusCode int, latencyMs int64) {
@@ -215,7 +216,24 @@ func (l *ForwardLogic) publishLog(provider, model string, statusCode int, latenc
 		l.Errorf("[日志] Redis Streams 发布失败: %v", err)
 	}
 
-	// ── 通道 2: RocketMQ（如果配置了）──
-	// 适合大规模日志聚合，支持分区并行消费
-	// mq.GlobalProducer.SendAsync("log", provider, entry)
+	// ── 通道 2: RocketMQ 异步发送 ──
+	// 高吞吐，不阻塞主链路，适合大规模日志聚合
+	if prod := mq.GetGlobalProducer(); prod != nil {
+		logMsg := mq.RequestLogMessage{
+			Provider:  provider,
+			Model:     model,
+			LatencyMs: latencyMs,
+			Timestamp: time.Now().UnixMilli(),
+		}
+		if statusCode >= 200 && statusCode < 300 {
+			logMsg.Status = "success"
+		} else {
+			logMsg.Status = "error"
+		}
+		prod.SendAsync(ctx, "log", provider, logMsg, func(err error) {
+			if err != nil {
+				l.Errorf("[日志] RocketMQ 发布失败: %v", err)
+			}
+		})
+	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ragent/router/services/proxy/internal/config"
 	"github.com/ragent/router/services/proxy/internal/svc"
+	"github.com/ragent/router/shared/mq"
 	"github.com/zeromicro/go-zero/core/conf"
 	"github.com/zeromicro/go-zero/zrpc"
 	"google.golang.org/grpc"
@@ -21,6 +22,9 @@ func main() {
 
 	svcCtx := svc.NewServiceContext(c)
 	_ = svcCtx
+
+	// 优雅退出时关闭 RocketMQ Producer
+	defer mq.CloseGlobalProducer()
 
 	// 启动 gRPC 服务器
 	server := zrpc.MustNewServer(c.RpcServerConf, func(grpcServer *grpc.Server) {

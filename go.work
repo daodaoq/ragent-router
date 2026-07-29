@@ -1,10 +1,10 @@
-go 1.22.7
+go 1.25.0
 
 use (
-	./shared
 	./rpc
 	./services/api
 	./services/provider
-	./services/router
 	./services/proxy
+	./services/router
+	./shared
 )
