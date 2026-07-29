@@ -38,7 +38,7 @@ func HashFNV64a(s string) uint64 {
 // Store 是限流器状态的持久化抽象。
 // 当前有两种实现：
 //   - ShardedStore：内存存储，分片锁，适合单实例部署
-//   - RedisStore：Redis 存储，分布式一致性，适合多实例部署（待实现）
+//   - RedisStore：Redis 存储，分布式一致性，适合多实例部署（见 redis_store.go）
 //
 // 接口方法的语义：
 //   - Load：如果 key 存在则返回已有值；否则调用 builder 创建新值、
